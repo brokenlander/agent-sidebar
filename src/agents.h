@@ -37,4 +37,7 @@ void agents_park_toggle(const char *sess);
 /* True when the name is on the park list, whether or not it is running. */
 int agents_park_has(const char *sess);
 
+/* Drop the cached pane map so the next load re-reads it from tmux. */
+void agents_invalidate(void);
+
 #endif

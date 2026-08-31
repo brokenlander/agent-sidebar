@@ -193,17 +193,27 @@ static int tty_map_load(struct ttyrow *rows, int cap)
    its old name indefinitely. */
 #define TTYMAP_TTL 5
 
+static int map_nrows;
+static time_t map_fetched;
+
+void agents_invalidate(void)
+{
+	map_fetched = 0;
+}
+
 static void resolve_panes(agent *a, int n)
 {
 	static struct ttyrow rows[TTYMAP_MAX];
-	static int nrows;
-	static time_t fetched;
+	int nrows = map_nrows;
+	time_t fetched = map_fetched;
 
 	time_t now = time(NULL);
-	if (nrows == 0 || now - fetched >= TTYMAP_TTL) {
+	if (nrows == 0 || fetched == 0 || now - fetched >= TTYMAP_TTL) {
 		nrows = tty_map_load(rows, TTYMAP_MAX);
 		fetched = now;
 	}
+	map_nrows = nrows;
+	map_fetched = fetched;
 	if (nrows == 0)
 		return;
 
@@ -241,6 +251,8 @@ static void resolve_panes(agent *a, int n)
 			break;
 		nrows = tty_map_load(rows, TTYMAP_MAX);
 		fetched = now;
+		map_nrows = nrows;
+		map_fetched = fetched;
 	}
 }
 

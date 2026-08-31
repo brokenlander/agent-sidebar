@@ -4,13 +4,16 @@
 #include "render.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <sys/inotify.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
@@ -52,6 +55,19 @@ static void term_size(int fd, int *cols, int *rows)
 	}
 	*cols = 32;
 	*rows = 40;
+}
+
+static void producer_dir(char *dst, size_t cap)
+{
+	const char *xdg = getenv("XDG_STATE_HOME");
+	const char *home = getenv("HOME");
+
+	if (xdg != NULL && *xdg != '\0')
+		snprintf(dst, cap, "%s/agent-sidebar/agents", xdg);
+	else
+		snprintf(dst, cap, "%s/.local/state/agent-sidebar/agents",
+			 home != NULL ? home : ".");
+	mkdir(dst, 0755); /* so the watch can be established before a producer runs */
 }
 
 static void sessions_dir(char *dst, size_t cap)
@@ -436,6 +452,12 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		park_rename(argv[2], argv[3]);
+
+		/* wake any running sidebar rather than making it wait out the
+		   pane-map TTL */
+		char pd[512];
+		producer_dir(pd, sizeof pd);
+		utimensat(AT_FDCWD, pd, NULL, 0);
 		return 0;
 	}
 
@@ -494,13 +516,24 @@ int main(int argc, char **argv)
 	char dir[512];
 	sessions_dir(dir, sizeof dir);
 
+	/* Watch both producer directories: the agent's own state, and the one
+	   plugins write to. A rename touches the latter deliberately, which is
+	   what makes a renamed session appear at once rather than on the TTL. */
+	char pdir[512];
+	producer_dir(pdir, sizeof pdir);
+
 	int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-	int wd = -1;
-	if (ifd >= 0)
-		wd = inotify_add_watch(ifd, dir,
-				       IN_CLOSE_WRITE | IN_MOVED_TO |
-				       IN_CREATE | IN_DELETE | IN_MODIFY);
-	if (wd < 0 && ifd >= 0) {
+	int watches = 0;
+	if (ifd >= 0) {
+		const uint32_t mask = IN_CLOSE_WRITE | IN_MOVED_TO |
+				      IN_CREATE | IN_DELETE | IN_MODIFY |
+				      IN_ATTRIB;
+		if (inotify_add_watch(ifd, dir, mask) >= 0)
+			watches++;
+		if (inotify_add_watch(ifd, pdir, mask) >= 0)
+			watches++;
+	}
+	if (watches == 0 && ifd >= 0) {
 		close(ifd);
 		ifd = -1; /* fall back to the poll timeout alone */
 	}
@@ -555,6 +588,7 @@ int main(int argc, char **argv)
 			char drain[4096];
 			while (read(ifd, drain, sizeof drain) > 0)
 				; /* the rebuild above re-reads the truth */
+			agents_invalidate();
 		}
 		if (rc > 0 && slot_stdin >= 0 &&
 		    (pfd[slot_stdin].revents & POLLIN))
