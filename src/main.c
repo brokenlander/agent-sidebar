@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
+#include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <termios.h>
@@ -102,8 +103,86 @@ static void tty_setup(void)
 	emit("\033[?1000h\033[?1006h");
 }
 
-/* Everything interpolated into the shell command below must pass this first.
-   tmux session names are user-chosen, so this is the boundary. */
+/* Run tmux with an argv array. No shell is involved, so a session name may
+   contain spaces, quotes or anything else without quoting or an allowlist. */
+static int run_tmux(char *const argv[])
+{
+	pid_t pid = fork();
+
+	if (pid < 0)
+		return -1;
+	if (pid == 0) {
+		execvp("tmux", argv);
+		_exit(127);
+	}
+
+	int st = 0;
+	while (waitpid(pid, &st, 0) < 0)
+		if (errno != EINTR)
+			return -1;
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+/* Same, capturing the first line of stdout. */
+static int capture_tmux(char *const argv[], char *out, size_t cap)
+{
+	int fds[2];
+
+	if (cap == 0)
+		return -1;
+	out[0] = '\0';
+	if (pipe(fds) != 0)
+		return -1;
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(fds[0]);
+		close(fds[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		close(fds[0]);
+		dup2(fds[1], STDOUT_FILENO);
+		close(fds[1]);
+		execvp("tmux", argv);
+		_exit(127);
+	}
+
+	close(fds[1]);
+	size_t got = 0;
+	for (;;) {
+		ssize_t r = read(fds[0], out + got, cap - 1 - got);
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0)
+			break;
+		got += (size_t)r;
+		if (got >= cap - 1)
+			break;
+	}
+	close(fds[0]);
+	out[got] = '\0';
+
+	char *nl = strchr(out, '\n');
+	if (nl != NULL)
+		*nl = '\0';
+
+	int st = 0;
+	while (waitpid(pid, &st, 0) < 0)
+		if (errno != EINTR)
+			return -1;
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+/* Failures used to be swallowed by 2>/dev/null, which made a rejected rename
+   look like a crash. Say so on the status line instead. */
+static void notify(const char *msg)
+{
+	char *argv[] = { (char *)"tmux", (char *)"display-message",
+			 (char *)"--", (char *)msg, NULL };
+	run_tmux(argv);
+}
+
 static int safe_token(const char *s)
 {
 	if (*s == '\0')
@@ -129,23 +208,13 @@ static const char *my_session(void)
 	done = 1;
 
 	const char *pane = getenv("TMUX_PANE");
-	if (pane == NULL || !safe_token(pane))
+	if (pane == NULL)
 		return cached;
 
-	char cmd[256];
-	snprintf(cmd, sizeof cmd,
-		 "tmux display-message -p -t '%s' '#{session_name}' 2>/dev/null",
-		 pane);
-
-	FILE *fp = popen(cmd, "r");
-	if (fp == NULL)
-		return cached;
-	if (fgets(cached, sizeof cached, fp) != NULL) {
-		char *nl = strchr(cached, '\n');
-		if (nl != NULL)
-			*nl = '\0';
-	}
-	pclose(fp);
+	char *argv[] = { (char *)"tmux", (char *)"display-message",
+			 (char *)"-p", (char *)"-t", (char *)pane,
+			 (char *)"#{session_name}", NULL };
+	capture_tmux(argv, cached, sizeof cached);
 	return cached;
 }
 
@@ -154,31 +223,38 @@ static const char *my_session(void)
    "current", which is ambiguous with several clients attached. */
 static void jump_to(const agent *a)
 {
-	if (!safe_token(a->pane_id) || !safe_token(a->sess))
+	if (a->pane_id[0] == '\0')
 		return;
 
 	const char *mine = my_session();
-	char cmd[1024];
+	char client[128] = "";
 
-	if (safe_token(mine))
-		snprintf(cmd, sizeof cmd,
-			 "c=$(tmux list-clients -t '%s' -F '#{client_name}' "
-			 "2>/dev/null | head -1); "
-			 "[ -n \"$c\" ] && tmux switch-client -c \"$c\" "
-			 "-t '%s' 2>/dev/null; "
-			 "tmux select-window -t '%s' 2>/dev/null; "
-			 "tmux select-pane -t '%s' 2>/dev/null",
-			 mine, a->sess, a->pane_id, a->pane_id);
-	else
-		snprintf(cmd, sizeof cmd,
-			 "tmux switch-client -t '%s' 2>/dev/null; "
-			 "tmux select-window -t '%s' 2>/dev/null; "
-			 "tmux select-pane -t '%s' 2>/dev/null",
-			 a->sess, a->pane_id, a->pane_id);
+	if (mine[0] != '\0') {
+		char *lc[] = { (char *)"tmux", (char *)"list-clients",
+			       (char *)"-t", (char *)mine, (char *)"-F",
+			       (char *)"#{client_name}", NULL };
+		capture_tmux(lc, client, sizeof client);
+	}
 
-	trace("jump cmd: %s", cmd);
-	int rc = system(cmd);
-	trace("jump rc=%d", rc);
+	if (client[0] != '\0') {
+		char *sw[] = { (char *)"tmux", (char *)"switch-client",
+			       (char *)"-c", client, (char *)"-t",
+			       (char *)a->sess, NULL };
+		run_tmux(sw);
+	} else {
+		char *sw[] = { (char *)"tmux", (char *)"switch-client",
+			       (char *)"-t", (char *)a->sess, NULL };
+		run_tmux(sw);
+	}
+
+	char *w[] = { (char *)"tmux", (char *)"select-window", (char *)"-t",
+		      (char *)a->pane_id, NULL };
+	char *pn[] = { (char *)"tmux", (char *)"select-pane", (char *)"-t",
+		       (char *)a->pane_id, NULL };
+	run_tmux(w);
+	run_tmux(pn);
+
+	trace("jump sess=%s pane=%s client=%s", a->sess, a->pane_id, client);
 }
 
 /* tmux renders the menu, handles its keys and runs the chosen command, so the
@@ -348,14 +424,17 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	if (argc >= 4 && strcmp(argv[1], "--rename-session") == 0) {
-		if (!safe_token(argv[2]) || !safe_token(argv[3]))
+		if (argv[3][0] == '\0') {
+			notify("claude-sidebar: rename needs a name");
 			return 2;
-		char cmd[512];
-		snprintf(cmd, sizeof cmd,
-			 "tmux rename-session -t '%s' -- '%s' 2>/dev/null",
-			 argv[2], argv[3]);
-		int rc = system(cmd);
-		(void)rc;
+		}
+		char *rn[] = { (char *)"tmux", (char *)"rename-session",
+			       (char *)"-t", argv[2], (char *)"--", argv[3],
+			       NULL };
+		if (run_tmux(rn) != 0) {
+			notify("claude-sidebar: rename failed");
+			return 1;
+		}
 		park_rename(argv[2], argv[3]);
 		return 0;
 	}
