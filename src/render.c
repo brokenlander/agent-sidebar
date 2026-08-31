@@ -84,7 +84,6 @@ static const char *status_colour(agent_status s)
 	switch (s) {
 	case ST_WAITING: return "\033[38;5;214m"; /* amber - needs you */
 	case ST_IDLE:    return "\033[38;5;114m"; /* green - your turn */
-	case ST_SHELL:   return "\033[38;5;110m"; /* blue  - in a shell */
 	case ST_BUSY:    return "\033[38;5;204m"; /* red   - working */
 	default:         return "\033[38;5;244m";
 	}
@@ -117,11 +116,12 @@ static const char *basename_of(const char *p)
 	return (slash != NULL && slash[1] != '\0') ? slash + 1 : p;
 }
 
-static void put_line(frame *f, const linebuf *lb)
+static void put_line(frame *f, const linebuf *lb, int agent_index)
 {
 	if (f->rows >= FRAME_ROWS)
 		return;
 	memcpy(f->line[f->rows], lb->buf, lb->len + 1);
+	f->row_agent[f->rows] = agent_index;
 	f->rows++;
 }
 
@@ -132,11 +132,18 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 	int count[ST_UNKNOWN + 1] = { 0 };
 
 	f->rows = 0;
+	for (int i = 0; i < FRAME_ROWS; i++)
+		f->row_agent[i] = -1;
 	if (cols < 12)
 		cols = 12;
 
-	for (int i = 0; i < n; i++)
-		count[a[i].status]++;
+	int nparked = 0;
+	for (int i = 0; i < n; i++) {
+		if (a[i].parked)
+			nparked++;
+		else
+			count[a[i].status]++;
+	}
 
 	/* header: total, then a tally that only shows non-empty states */
 	lb_init(&lb, cols);
@@ -150,9 +157,17 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 		lb_text(&lb, t);
 	}
 	lb_raw(&lb, C_RESET);
-	put_line(f, &lb);
+	put_line(f, &lb, -1);
 
 	lb_init(&lb, cols);
+	if (nparked > 0) {
+		char t[32];
+		snprintf(t, sizeof t, " %d", nparked);
+		lb_raw(&lb, C_DIM);
+		lb_text(&lb, " \xe2\x97\x8b");
+		lb_text(&lb, t);
+		lb_raw(&lb, C_RESET);
+	}
 	for (int s = 0; s <= ST_UNKNOWN; s++) {
 		if (count[s] == 0)
 			continue;
@@ -164,14 +179,14 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 		lb_text(&lb, t);
 		lb_raw(&lb, C_RESET);
 	}
-	put_line(f, &lb);
+	put_line(f, &lb, -1);
 
 	lb_init(&lb, cols);
 	lb_raw(&lb, C_DIM);
 	for (int i = 0; i < cols; i++)
 		lb_text(&lb, "\xe2\x94\x80"); /* ─ */
 	lb_raw(&lb, C_RESET);
-	put_line(f, &lb);
+	put_line(f, &lb, -1);
 
 	/* one row per agent: dot, identifier, right-aligned age */
 	for (int i = 0; i < n && f->rows < rows; i++) {
@@ -184,10 +199,18 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 			label = "?";
 
 		lb_init(&lb, cols);
-		lb_raw(&lb, status_colour(g->status));
-		lb_text(&lb, " \xe2\x97\x8f ");
-		lb_raw(&lb, C_RESET);
-		lb_text(&lb, label);
+		if (g->parked) {
+			/* a hollow, dimmed dot: still visible, clearly set aside */
+			lb_raw(&lb, C_DIM);
+			lb_text(&lb, " \xe2\x97\x8b ");
+			lb_text(&lb, label);
+			lb_raw(&lb, C_RESET);
+		} else {
+			lb_raw(&lb, status_colour(g->status));
+			lb_text(&lb, " \xe2\x97\x8f ");
+			lb_raw(&lb, C_RESET);
+			lb_text(&lb, label);
+		}
 
 		/* room for the cwd basename only on a wide enough pane */
 		int agew = (int)strlen(age);
@@ -205,7 +228,7 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 		lb_pad_to(&lb, cols - agew - 1);
 		lb_text(&lb, age);
 		lb_raw(&lb, C_RESET);
-		put_line(f, &lb);
+		put_line(f, &lb, i);
 	}
 
 	if (n == 0) {
@@ -213,7 +236,7 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 		lb_raw(&lb, C_DIM);
 		lb_text(&lb, " no agents");
 		lb_raw(&lb, C_RESET);
-		put_line(f, &lb);
+		put_line(f, &lb, -1);
 	}
 }
 

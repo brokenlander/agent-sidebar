@@ -8,6 +8,7 @@
 
 typedef struct {
 	char line[FRAME_ROWS][LINE_MAX];
+	int row_agent[FRAME_ROWS]; /* agent index shown on that row, else -1 */
 	int rows;
 } frame;
 

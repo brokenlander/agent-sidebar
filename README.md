@@ -4,16 +4,34 @@ A tmux sidebar showing every Claude Code agent on the machine: what state it is
 in, which tmux session it lives in, and how long it has been that way.
 
 ```
- claude                   16
- ● 12  ● 1  ● 3
+ claude                   17
+ ○ 1  ● 11  ● 5
 ──────────────────────────────
  ● PR-4 gateway-api       2m
  ● summit kg-summit       4d
  ● csi gateway-api       11m
+ ○ price gpu-calculator    4d   <- parked
 ```
 
-Amber needs you, green is idle and yours, blue dropped to a shell, red is
-working. Sorted so whatever needs you is at the top.
+Amber needs you, green is idle and yours, red is working. An agent that has
+backgrounded a shell command still counts as idle - it is not a state you act
+on differently. Sorted so whatever needs you is at the top.
+
+## Clicking
+
+- **Left-click a row** to jump to that agent: the client looking at the sidebar
+  switches session, window and pane in one go.
+- **Middle-click a row** to park it. Parked agents sink below everything else,
+  whatever they are doing, and render as a hollow dimmed dot. Middle-click again
+  to bring one back.
+
+Parking is per tmux session name and survives restarts, in
+`$XDG_STATE_HOME/claude-sidebar/parked` (default `~/.local/state/...`). It is a
+plain list of session names, so it is editable by hand.
+
+Right-click is deliberately unused: many tmux configs bind `MouseDown3Pane`
+themselves, and a binding takes precedence over forwarding the event to the
+pane's application.
 
 ## Why it is cheap
 
@@ -45,6 +63,15 @@ On top of that:
 Measured over 30 seconds against 16 live agents: **0% CPU for the sidebar, ~1%
 for the tmux server.**
 
+## Debugging
+
+```sh
+./claude-sidebar --debug                 # dump resolved agent rows and exit
+CLAUDE_SIDEBAR_TRACE=/tmp/cs.log ./claude-sidebar   # log input and jump commands
+```
+
+The trace costs one `getenv` per input event and nothing at all when unset.
+
 ## Build
 
 ```sh
@@ -73,10 +100,10 @@ Or run it in any pane directly:
 
 ## What it does not do
 
-It is a display, not a controller — no keyboard handling, no jumping, no killing.
-That is deliberate: making the pane interactive is what turns it into a TUI with
-a repaint loop, which is the cost this design exists to avoid. Pair it with a
-picker bound to its own key for jumping.
+No keyboard handling and no killing agents. Mouse input costs nothing - the same
+`poll` that waits on inotify waits on stdin - but a keyboard-driven TUI implies
+selection state, cursor movement and a repaint loop, which is the cost this
+design exists to avoid.
 
 ## Caveats
 

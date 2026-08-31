@@ -5,8 +5,7 @@
 
 typedef enum {
 	ST_WAITING = 0, /* needs you */
-	ST_IDLE,        /* done, your turn */
-	ST_SHELL,       /* dropped to a shell */
+	ST_IDLE,        /* done, your turn - a backgrounded shell counts as idle */
 	ST_BUSY,        /* working, leave it */
 	ST_UNKNOWN
 } agent_status;
@@ -18,7 +17,9 @@ typedef struct {
 	char cwd[256];   /* $HOME collapsed to ~ */
 	char pane[64];   /* tmux target "sess:@win.%pane", empty if not in tmux */
 	char sess[64];   /* tmux session name alone */
+	char pane_id[32]; /* "%27" - a complete tmux target on its own */
 	long long seen_ms;
+	int parked;      /* muted by the user: sorts last, dimmed */
 } agent;
 
 /* Live interactive agents from $CLAUDE_CONFIG_DIR/sessions (default
@@ -27,5 +28,9 @@ typedef struct {
 int agents_load(agent *out, int cap);
 
 const char *agent_status_label(agent_status s);
+
+/* Park list: tmux session names the user has muted, one per line, in
+   $XDG_STATE_HOME/claude-sidebar/parked (default ~/.local/state/...). */
+void agents_park_toggle(const char *sess);
 
 #endif

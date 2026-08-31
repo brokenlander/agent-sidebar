@@ -138,6 +138,7 @@ struct ttyrow {
 	char tty[64];
 	char target[64];
 	char sess[64];
+	char pane_id[32];
 };
 
 /* One `tmux list-panes` for the whole fleet, cached, and only ever run when
@@ -146,7 +147,8 @@ static int tty_map_load(struct ttyrow *rows, int cap)
 {
 	FILE *fp = popen("tmux list-panes -a -F "
 			 "'#{pane_tty}\t#{session_name}\t"
-			 "#{session_name}:#{window_index}.#{pane_index}' "
+			 "#{session_name}:#{window_index}.#{pane_index}\t"
+			 "#{pane_id}' "
 			 "2>/dev/null", "r");
 	if (fp == NULL)
 		return 0;
@@ -166,6 +168,9 @@ static int tty_map_load(struct ttyrow *rows, int cap)
 		if (t2 == NULL)
 			continue;
 		*t2 = '\0';
+		char *t3 = strchr(t2 + 1, '\t');
+		if (t3 != NULL)
+			*t3 = '\0';
 
 		snprintf(rows[n].tty, sizeof rows[n].tty, "%.*s",
 			 (int)(sizeof rows[n].tty - 1), line);
@@ -173,6 +178,9 @@ static int tty_map_load(struct ttyrow *rows, int cap)
 			 (int)(sizeof rows[n].sess - 1), t1 + 1);
 		snprintf(rows[n].target, sizeof rows[n].target, "%.*s",
 			 (int)(sizeof rows[n].target - 1), t2 + 1);
+		snprintf(rows[n].pane_id, sizeof rows[n].pane_id, "%.*s",
+			 (int)(sizeof rows[n].pane_id - 1),
+			 t3 != NULL ? t3 + 1 : "");
 		n++;
 	}
 	pclose(fp);
@@ -189,6 +197,7 @@ static void resolve_panes(agent *a, int n)
 		long long pid;
 		char target[64];
 		char sess[64];
+		char pane_id[32];
 	} cache[AGENT_MAX];
 	static int ncache;
 
@@ -205,6 +214,8 @@ static void resolve_panes(agent *a, int n)
 				 cache[c].target);
 			snprintf(a[i].sess, sizeof a[i].sess, "%s",
 				 cache[c].sess);
+			snprintf(a[i].pane_id, sizeof a[i].pane_id, "%s",
+				 cache[c].pane_id);
 			hit = 1; /* an empty entry means "known: not in tmux" */
 			break;
 		}
@@ -238,6 +249,8 @@ static void resolve_panes(agent *a, int n)
 				 rows[found].target);
 			snprintf(a[i].sess, sizeof a[i].sess, "%s",
 				 rows[found].sess);
+			snprintf(a[i].pane_id, sizeof a[i].pane_id, "%s",
+				 rows[found].pane_id);
 		}
 
 		/* record the outcome either way, so an agent that is not in
@@ -250,6 +263,9 @@ static void resolve_panes(agent *a, int n)
 			snprintf(cache[ncache].sess,
 				 sizeof cache[ncache].sess, "%s",
 				 found >= 0 ? rows[found].sess : "");
+			snprintf(cache[ncache].pane_id,
+				 sizeof cache[ncache].pane_id, "%s",
+				 found >= 0 ? rows[found].pane_id : "");
 			ncache++;
 		}
 	}
@@ -261,8 +277,6 @@ static agent_status parse_status(const char *s)
 		return ST_WAITING;
 	if (strcmp(s, "idle") == 0)
 		return ST_IDLE;
-	if (strcmp(s, "shell") == 0)
-		return ST_SHELL;
 	if (strcmp(s, "busy") == 0 || strcmp(s, "working") == 0)
 		return ST_BUSY;
 	return ST_UNKNOWN;
@@ -273,7 +287,6 @@ const char *agent_status_label(agent_status s)
 	switch (s) {
 	case ST_WAITING: return "waiting";
 	case ST_IDLE:    return "idle";
-	case ST_SHELL:   return "shell";
 	case ST_BUSY:    return "working";
 	default:         return "?";
 	}
@@ -298,10 +311,109 @@ static void collapse_home(char *path, size_t cap)
 	snprintf(path, cap, "%s", tmp);
 }
 
+static void park_path(char *dst, size_t cap)
+{
+	const char *xdg = getenv("XDG_STATE_HOME");
+	const char *home = getenv("HOME");
+
+	if (xdg != NULL && *xdg != '\0')
+		snprintf(dst, cap, "%s/claude-sidebar/parked", xdg);
+	else
+		snprintf(dst, cap, "%s/.local/state/claude-sidebar/parked",
+			 home != NULL ? home : ".");
+}
+
+#define PARK_MAX 128
+
+static char park_list[PARK_MAX][64];
+static int park_n;
+
+static void park_load(void)
+{
+	char path[512];
+	park_path(path, sizeof path);
+	park_n = 0;
+
+	FILE *fp = fopen(path, "r");
+	if (fp == NULL)
+		return;
+
+	char line[128];
+	while (park_n < PARK_MAX && fgets(line, sizeof line, fp) != NULL) {
+		char *nl = strchr(line, '\n');
+		if (nl != NULL)
+			*nl = '\0';
+		if (line[0] == '\0')
+			continue;
+		snprintf(park_list[park_n], sizeof park_list[park_n], "%.*s",
+			 (int)(sizeof park_list[park_n] - 1), line);
+		park_n++;
+	}
+	fclose(fp);
+}
+
+static int park_contains(const char *sess)
+{
+	if (sess == NULL || *sess == '\0')
+		return 0;
+	for (int i = 0; i < park_n; i++)
+		if (strcmp(park_list[i], sess) == 0)
+			return 1;
+	return 0;
+}
+
+void agents_park_toggle(const char *sess)
+{
+	char path[512];
+	char dir[512];
+
+	if (sess == NULL || *sess == '\0')
+		return;
+
+	park_load();
+
+	int at = -1;
+	for (int i = 0; i < park_n; i++)
+		if (strcmp(park_list[i], sess) == 0)
+			at = i;
+
+	if (at >= 0) {
+		for (int i = at; i < park_n - 1; i++)
+			memcpy(park_list[i], park_list[i + 1],
+			       sizeof park_list[i]);
+		park_n--;
+	} else if (park_n < PARK_MAX) {
+		snprintf(park_list[park_n], sizeof park_list[park_n], "%.*s",
+			 (int)(sizeof park_list[park_n] - 1), sess);
+		park_n++;
+	}
+
+	park_path(path, sizeof path);
+	snprintf(dir, sizeof dir, "%s", path);
+	char *slash = strrchr(dir, '/');
+	if (slash != NULL) {
+		*slash = '\0';
+		char mk[600];
+		snprintf(mk, sizeof mk, "mkdir -p '%s'", dir);
+		int rc = system(mk);
+		(void)rc;
+	}
+
+	FILE *fp = fopen(path, "w");
+	if (fp == NULL)
+		return;
+	for (int i = 0; i < park_n; i++)
+		fprintf(fp, "%s\n", park_list[i]);
+	fclose(fp);
+}
+
 static int cmp_agent(const void *a, const void *b)
 {
 	const agent *x = a, *y = b;
 
+	/* muted agents sink below everything, whatever they are doing */
+	if (x->parked != y->parked)
+		return x->parked - y->parked;
 	if (x->status != y->status)
 		return (int)x->status - (int)y->status;
 	/* freshest first inside a group */
@@ -393,6 +505,10 @@ int agents_load(agent *out, int cap)
 			a->sess[sn] = '\0';
 		}
 
+		const char *dot = strrchr(a->pane, '.');
+		if (dot != NULL && dot[1] == '%')
+			snprintf(a->pane_id, sizeof a->pane_id, "%s", dot + 1);
+
 		a->seen_ms = json_int(json_get(&o, "statusUpdatedAt"),
 				      json_int(json_get(&o, "updatedAt"), 0));
 		n++;
@@ -400,6 +516,11 @@ int agents_load(agent *out, int cap)
 	closedir(d);
 
 	resolve_panes(out, n);
+
+	park_load();
+	for (int i = 0; i < n; i++)
+		out[i].parked = park_contains(out[i].sess);
+
 	qsort(out, (size_t)n, sizeof *out, cmp_agent);
 	return n;
 }
