@@ -275,7 +275,8 @@ static agent_status parse_status(const char *s)
 {
 	if (strcmp(s, "waiting") == 0 || strcmp(s, "blocked") == 0)
 		return ST_WAITING;
-	if (strcmp(s, "idle") == 0)
+	/* a backgrounded shell command is not a state you act on differently */
+	if (strcmp(s, "idle") == 0 || strcmp(s, "shell") == 0)
 		return ST_IDLE;
 	if (strcmp(s, "busy") == 0 || strcmp(s, "working") == 0)
 		return ST_BUSY;
