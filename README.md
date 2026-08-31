@@ -21,17 +21,26 @@ on differently. Sorted so whatever needs you is at the top.
 
 - **Left-click a row** to jump to that agent: the client looking at the sidebar
   switches session, window and pane in one go.
-- **Middle-click a row** to park it. Parked agents sink below everything else,
-  whatever they are doing, and render as a hollow dimmed dot. Middle-click again
-  to bring one back.
+- **Right-click or middle-click a row** to park it. Parked agents sink below
+  everything else, whatever they are doing, and render as a hollow dimmed dot.
+  Click again to bring one back.
 
 Parking is per tmux session name and survives restarts, in
 `$XDG_STATE_HOME/claude-sidebar/parked` (default `~/.local/state/...`). It is a
 plain list of session names, so it is editable by hand.
 
-Right-click is deliberately unused: many tmux configs bind `MouseDown3Pane`
-themselves, and a binding takes precedence over forwarding the event to the
-pane's application.
+Right-click only reaches the sidebar if your config forwards it. Many configs
+bind `MouseDown3Pane` unconditionally, and a binding takes precedence over
+forwarding the event to the pane's application. The fix is to forward when the
+pane has asked for mouse events:
+
+```tmux
+bind -n MouseDown3Pane if -F "#{||:#{pane_in_mode},#{mouse_any_flag}}" \
+  { send -M } { select-pane -t= ; run-shell '/path/to/your-paste-script' }
+```
+
+Middle-click works either way, since tmux's default `MouseDown2Pane` binding
+already forwards on that condition.
 
 ## Why it is cheap
 

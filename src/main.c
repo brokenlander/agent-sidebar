@@ -238,8 +238,8 @@ static void handle_input(const frame *f, const agent *a, int n)
 		if ((button & 64) != 0) /* wheel */
 			continue;
 		int which_button = button & 3;
-		if (which_button != 0 && which_button != 1)
-			continue; /* left jumps, middle parks, right is tmux's */
+		if (which_button > 2)
+			continue; /* left jumps; middle and right both park */
 
 		int idx = row - 1;
 		if (idx < 0 || idx >= f->rows)
