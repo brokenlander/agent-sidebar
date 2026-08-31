@@ -187,87 +187,60 @@ static int tty_map_load(struct ttyrow *rows, int cap)
 	return n;
 }
 
+/* How long a pane map may be reused. tmux answers list-panes in ~4ms, so a
+   short TTL costs nothing; an earlier version cached per pid forever, which
+   was right when a tmux call took seconds but left a renamed session showing
+   its old name indefinitely. */
+#define TTYMAP_TTL 5
+
 static void resolve_panes(agent *a, int n)
 {
 	static struct ttyrow rows[TTYMAP_MAX];
-	/* pid -> pane, resolved once and kept: a live agent does not migrate
-	   panes, so this reduces the tmux round trips to one per new agent
-	   rather than one every refresh. */
-	static struct {
-		long long pid;
-		char target[64];
-		char sess[64];
-		char pane_id[32];
-	} cache[AGENT_MAX];
-	static int ncache;
+	static int nrows;
+	static time_t fetched;
 
-	int unknown = 0;
-	for (int i = 0; i < n; i++) {
-		if (a[i].pane[0] != '\0')
-			continue;
-
-		int hit = 0;
-		for (int c = 0; c < ncache; c++) {
-			if (cache[c].pid != a[i].pid)
-				continue;
-			snprintf(a[i].pane, sizeof a[i].pane, "%s",
-				 cache[c].target);
-			snprintf(a[i].sess, sizeof a[i].sess, "%s",
-				 cache[c].sess);
-			snprintf(a[i].pane_id, sizeof a[i].pane_id, "%s",
-				 cache[c].pane_id);
-			hit = 1; /* an empty entry means "known: not in tmux" */
-			break;
-		}
-		if (!hit)
-			unknown++;
+	time_t now = time(NULL);
+	if (nrows == 0 || now - fetched >= TTYMAP_TTL) {
+		nrows = tty_map_load(rows, TTYMAP_MAX);
+		fetched = now;
 	}
-	if (unknown == 0)
-		return;
-
-	int nrows = tty_map_load(rows, TTYMAP_MAX);
 	if (nrows == 0)
 		return;
 
-	for (int i = 0; i < n; i++) {
-		if (a[i].pane[0] != '\0')
-			continue;
+	/* Resolve every agent, not only the ones missing a pane: the session
+	   name in the JSON is written once at startup and does not follow a
+	   rename, so tmux is the authority for it. */
+	int unresolved = 0;
+	for (int pass = 0; pass < 2; pass++) {
+		unresolved = 0;
+		for (int i = 0; i < n; i++) {
+			char tty[64];
+			if (proc_tty(a[i].pid, tty, sizeof tty) != 0)
+				continue;
 
-		char tty[64];
-		int found = -1;
-		if (proc_tty(a[i].pid, tty, sizeof tty) == 0) {
+			int found = 0;
 			for (int r = 0; r < nrows; r++) {
-				if (strcmp(rows[r].tty, tty) == 0) {
-					found = r;
-					break;
-				}
+				if (strcmp(rows[r].tty, tty) != 0)
+					continue;
+				snprintf(a[i].pane, sizeof a[i].pane, "%s",
+					 rows[r].target);
+				snprintf(a[i].sess, sizeof a[i].sess, "%s",
+					 rows[r].sess);
+				snprintf(a[i].pane_id, sizeof a[i].pane_id,
+					 "%s", rows[r].pane_id);
+				found = 1;
+				break;
 			}
+			if (!found)
+				unresolved++;
 		}
 
-		if (found >= 0) {
-			snprintf(a[i].pane, sizeof a[i].pane, "%s",
-				 rows[found].target);
-			snprintf(a[i].sess, sizeof a[i].sess, "%s",
-				 rows[found].sess);
-			snprintf(a[i].pane_id, sizeof a[i].pane_id, "%s",
-				 rows[found].pane_id);
-		}
-
-		/* record the outcome either way, so an agent that is not in
-		   tmux is asked about once rather than on every refresh */
-		if (ncache < AGENT_MAX) {
-			cache[ncache].pid = a[i].pid;
-			snprintf(cache[ncache].target,
-				 sizeof cache[ncache].target, "%s",
-				 found >= 0 ? rows[found].target : "");
-			snprintf(cache[ncache].sess,
-				 sizeof cache[ncache].sess, "%s",
-				 found >= 0 ? rows[found].sess : "");
-			snprintf(cache[ncache].pane_id,
-				 sizeof cache[ncache].pane_id, "%s",
-				 found >= 0 ? rows[found].pane_id : "");
-			ncache++;
-		}
+		/* A pane created since the last load would otherwise wait out
+		   the TTL before appearing. */
+		if (unresolved == 0 || now - fetched < 1)
+			break;
+		nrows = tty_map_load(rows, TTYMAP_MAX);
+		fetched = now;
 	}
 }
 
