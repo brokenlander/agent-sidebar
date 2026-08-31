@@ -18,6 +18,7 @@
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t g_winch;
@@ -225,38 +226,53 @@ static const char *my_session(void)
    "current", which is ambiguous with several clients attached. */
 static void jump_to(const agent *a)
 {
+	/* The attached client rarely changes, and looking it up cost a whole
+	   round trip on every click. */
+	static char client[128];
+	static time_t client_at;
+	time_t now = time(NULL);
+
 	if (a->pane_id[0] == '\0')
 		return;
 
-	const char *mine = my_session();
-	char client[128] = "";
-
-	if (mine[0] != '\0') {
-		char *lc[] = { (char *)"tmux", (char *)"list-clients",
-			       (char *)"-t", (char *)mine, (char *)"-F",
-			       (char *)"#{client_name}", NULL };
-		capture_tmux(lc, client, sizeof client);
+	if (client[0] == '\0' || now - client_at >= 10) {
+		const char *mine = my_session();
+		if (mine[0] != '\0') {
+			char *lc[] = { (char *)"tmux", (char *)"list-clients",
+				       (char *)"-t", (char *)mine, (char *)"-F",
+				       (char *)"#{client_name}", NULL };
+			capture_tmux(lc, client, sizeof client);
+		}
+		client_at = now;
 	}
 
-	if (client[0] != '\0') {
-		char *sw[] = { (char *)"tmux", (char *)"switch-client",
-			       (char *)"-c", client, (char *)"-t",
-			       (char *)a->sess, NULL };
-		run_tmux(sw);
-	} else {
-		char *sw[] = { (char *)"tmux", (char *)"switch-client",
-			       (char *)"-t", (char *)a->sess, NULL };
-		run_tmux(sw);
-	}
+	/* One invocation, one round trip: tmux takes ';' as a command
+	   separator in argv, so switching and focusing happen together. */
+	char *with_client[] = {
+		(char *)"tmux",
+		(char *)"switch-client", (char *)"-c", client,
+		(char *)"-t", (char *)a->sess, (char *)";",
+		(char *)"select-window", (char *)"-t", (char *)a->pane_id,
+		(char *)";",
+		(char *)"select-pane", (char *)"-t", (char *)a->pane_id,
+		NULL,
+	};
+	char *no_client[] = {
+		(char *)"tmux",
+		(char *)"switch-client", (char *)"-t", (char *)a->sess,
+		(char *)";",
+		(char *)"select-window", (char *)"-t", (char *)a->pane_id,
+		(char *)";",
+		(char *)"select-pane", (char *)"-t", (char *)a->pane_id,
+		NULL,
+	};
 
-	char *w[] = { (char *)"tmux", (char *)"select-window", (char *)"-t",
-		      (char *)a->pane_id, NULL };
-	char *pn[] = { (char *)"tmux", (char *)"select-pane", (char *)"-t",
-		       (char *)a->pane_id, NULL };
-	run_tmux(w);
-	run_tmux(pn);
+	int rc = run_tmux(client[0] != '\0' ? with_client : no_client);
+	if (rc != 0)
+		client[0] = '\0'; /* stale client: re-resolve on the next click */
 
-	trace("jump sess=%s pane=%s client=%s", a->sess, a->pane_id, client);
+	trace("jump sess=%s pane=%s client=%s rc=%d", a->sess, a->pane_id,
+	      client, rc);
 }
 
 /* tmux renders the menu, handles its keys and runs the chosen command, so the
