@@ -146,6 +146,33 @@ static void t_real_files(void)
 	check(seen > 0 && parsed == seen, "every real session file parses");
 }
 
+/* The producer writes this file; the reader must agree on every field it
+   depends on, or an opencode row silently vanishes. */
+static void t_producer_fixture(void)
+{
+	FILE *f = fopen("tests/fixtures/opencode-live.json", "rb");
+	if (f == NULL) {
+		printf("  SKIP  producer fixture (not found)\n");
+		return;
+	}
+
+	static char buf[65536];
+	size_t len = fread(buf, 1, sizeof buf, f);
+	fclose(f);
+
+	jobj o;
+	char s[64];
+	check(json_parse(buf, len, &o) == 0, "producer fixture parses");
+	check(json_int(json_get(&o, "pid"), -1) > 0, "fixture has a pid");
+	check(json_int(json_get(&o, "procStart"), -1) >= 0,
+	      "fixture has procStart the reader can compare");
+	check(json_string(json_get(&o, "status"), s, sizeof s) == 0,
+	      "fixture has a status");
+	check(json_string(json_get(&o, "kind"), s, sizeof s) == 0 &&
+	      strcmp(s, "interactive") == 0, "fixture kind is interactive");
+	check(json_string(json_get(&o, "cwd"), s, sizeof s) == 0, "fixture has cwd");
+}
+
 static void t_render_widths(void)
 {
 	static agent a[3];
@@ -182,6 +209,7 @@ int main(void)
 	t_malformed();
 	t_truncation();
 	t_real_files();
+	t_producer_fixture();
 	t_render_widths();
 
 	if (fails == 0) {

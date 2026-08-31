@@ -20,6 +20,8 @@ test: tests/test_json.c $(SRC)
 	$(CC) -std=c17 -g -O1 -Wall -Wextra -fsanitize=address,undefined \
 	      -fno-omit-frame-pointer -o /tmp/cs-test tests/test_json.c $(SRC)
 	@/tmp/cs-test
+	@command -v node >/dev/null && node tests/test_opencode_plugin.mjs || \
+		echo "  SKIP  opencode producer tests (node not found)"
 
 sanitize: $(SRC) $(MAIN)
 	$(CC) -std=c17 -g -O1 -Wall -Wextra -fsanitize=address,undefined \

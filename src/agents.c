@@ -404,26 +404,13 @@ static int cmp_agent(const void *a, const void *b)
 	return 0;
 }
 
-int agents_load(agent *out, int cap)
+static int scan_dir(const char *dir, agent *out, int cap, int n)
 {
-	char dir[512];
-	const char *cfg = getenv("CLAUDE_CONFIG_DIR");
-
-	if (cfg != NULL && *cfg != '\0') {
-		snprintf(dir, sizeof dir, "%s/sessions", cfg);
-	} else {
-		const char *home = getenv("HOME");
-		if (home == NULL)
-			return -1;
-		snprintf(dir, sizeof dir, "%s/.claude/sessions", home);
-	}
-
 	DIR *d = opendir(dir);
 	if (d == NULL)
-		return -1;
+		return n; /* a producer that is not installed is not an error */
 
 	static char buf[FILE_MAX];
-	int n = 0;
 	struct dirent *e;
 
 	while ((e = readdir(d)) != NULL && n < cap) {
@@ -469,6 +456,7 @@ int agents_load(agent *out, int cap)
 
 		json_string(json_get(&o, "name"), a->name, sizeof a->name);
 		json_string(json_get(&o, "cwd"), a->cwd, sizeof a->cwd);
+		json_string(json_get(&o, "agent"), a->agent, sizeof a->agent);
 		collapse_home(a->cwd, sizeof a->cwd);
 
 		const jslice *tv = json_get(&o, "tmux");
@@ -494,6 +482,45 @@ int agents_load(agent *out, int cap)
 		n++;
 	}
 	closedir(d);
+	return n;
+}
+
+/* Where each producer writes. Claude Code writes its own natively; everything
+   else goes through a plugin into our state dir. Same file shape either way,
+   so this is one scanner over two directories. */
+int agents_load(agent *out, int cap)
+{
+	char claude_dir[512];
+	char plugin_dir[512];
+	const char *home = getenv("HOME");
+	const char *cfg = getenv("CLAUDE_CONFIG_DIR");
+	const char *xdg = getenv("XDG_STATE_HOME");
+
+	if (cfg != NULL && *cfg != '\0')
+		snprintf(claude_dir, sizeof claude_dir, "%s/sessions", cfg);
+	else if (home != NULL)
+		snprintf(claude_dir, sizeof claude_dir, "%s/.claude/sessions",
+			 home);
+	else
+		claude_dir[0] = '\0';
+
+	if (xdg != NULL && *xdg != '\0')
+		snprintf(plugin_dir, sizeof plugin_dir,
+			 "%s/agent-sidebar/agents", xdg);
+	else if (home != NULL)
+		snprintf(plugin_dir, sizeof plugin_dir,
+			 "%s/.local/state/agent-sidebar/agents", home);
+	else
+		plugin_dir[0] = '\0';
+
+	int n = 0;
+	if (claude_dir[0] != '\0')
+		n = scan_dir(claude_dir, out, cap, n);
+	if (plugin_dir[0] != '\0')
+		n = scan_dir(plugin_dir, out, cap, n);
+
+	if (n == 0)
+		return 0;
 
 	resolve_panes(out, n);
 

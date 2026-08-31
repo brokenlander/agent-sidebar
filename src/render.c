@@ -148,7 +148,7 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 	/* header: total, then a tally that only shows non-empty states */
 	lb_init(&lb, cols);
 	lb_raw(&lb, C_HEAD);
-	lb_text(&lb, " claude");
+	lb_text(&lb, " agents");
 	lb_raw(&lb, C_RESET C_DIM);
 	{
 		char t[32];

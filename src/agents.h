@@ -17,7 +17,8 @@ typedef struct {
 	char cwd[256];   /* $HOME collapsed to ~ */
 	char pane[64];   /* tmux target "sess:@win.%pane", empty if not in tmux */
 	char sess[64];   /* tmux session name alone */
-	char pane_id[32]; /* "%27" - a complete tmux target on its own */
+	char pane_id[32];
+	char agent[24];  /* producer: "opencode", empty for Claude Code */ /* "%27" - a complete tmux target on its own */
 	long long seen_ms;
 	int parked;      /* muted by the user: sorts last, dimmed */
 } agent;
