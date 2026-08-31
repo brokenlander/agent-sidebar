@@ -3,14 +3,14 @@
 # a window can never end up with two.
 set -u
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$DIR/claude-sidebar"
+BIN="$DIR/agent-sidebar"
 win="${1:-}"
 
-width="$(tmux show-option -gqv @claude_sidebar_width)"
+width="$(tmux show-option -gqv @agent_sidebar_width)"
 [ -z "$width" ] && width=34
 
 existing="$(tmux list-panes -t "$win" -F '#{pane_id} #{pane_current_command}' 2>/dev/null |
-	awk '$2 == "claude-sidebar" { print $1; exit }')"
+	awk '$2 == "agent-sidebar" { print $1; exit }')"
 
 if [ -n "$existing" ]; then
 	tmux kill-pane -t "$existing"
@@ -18,7 +18,7 @@ if [ -n "$existing" ]; then
 fi
 
 if [ ! -x "$BIN" ]; then
-	tmux display-message "claude-sidebar: not built - run 'make' in $DIR"
+	tmux display-message "agent-sidebar: not built - run 'make' in $DIR"
 	exit 0
 fi
 

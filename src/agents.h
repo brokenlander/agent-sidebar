@@ -30,7 +30,7 @@ int agents_load(agent *out, int cap);
 const char *agent_status_label(agent_status s);
 
 /* Park list: tmux session names the user has muted, one per line, in
-   $XDG_STATE_HOME/claude-sidebar/parked (default ~/.local/state/...). */
+   $XDG_STATE_HOME/agent-sidebar/parked (default ~/.local/state/...). */
 void agents_park_toggle(const char *sess);
 
 /* True when the name is on the park list, whether or not it is running. */

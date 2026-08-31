@@ -1,4 +1,4 @@
-# claude-sidebar
+# agent-sidebar
 
 A tmux sidebar showing every Claude Code agent on the machine: what state it is
 in, which tmux session it lives in, and how long it has been that way.
@@ -31,7 +31,7 @@ on differently. Sorted so whatever needs you is at the top.
   as a hollow dimmed dot. Click again to bring one back.
 
 Parking is per tmux session name and survives restarts, in
-`$XDG_STATE_HOME/claude-sidebar/parked` (default `~/.local/state/...`). It is a
+`$XDG_STATE_HOME/agent-sidebar/parked` (default `~/.local/state/...`). It is a
 plain list of session names, so it is editable by hand.
 
 Right-click only reaches the sidebar if your config forwards it. Many configs
@@ -80,8 +80,8 @@ for the tmux server.**
 ## Debugging
 
 ```sh
-./claude-sidebar --debug                 # dump resolved agent rows and exit
-CLAUDE_SIDEBAR_TRACE=/tmp/cs.log ./claude-sidebar   # log input and jump commands
+./agent-sidebar --debug                 # dump resolved agent rows and exit
+AGENT_SIDEBAR_TRACE=/tmp/cs.log ./agent-sidebar   # log input and jump commands
 ```
 
 The trace costs one `getenv` per input event and nothing at all when unset.
@@ -89,7 +89,7 @@ The trace costs one `getenv` per input event and nothing at all when unset.
 ## Build
 
 ```sh
-make          # -> ./claude-sidebar
+make          # -> ./agent-sidebar
 make test     # ASan + UBSan, fixtures plus every real session file on the box
 ```
 
@@ -100,16 +100,16 @@ No dependencies beyond libc.
 With TPM, in `~/.tmux.conf`:
 
 ```tmux
-set -g @plugin 'tmux-claude-sidebar'
-set -g @claude_sidebar_key 'e'     # prefix + e toggles
-set -g @claude_sidebar_width '34'
+set -g @plugin 'agent-sidebar'
+set -g @agent_sidebar_key 'e'     # prefix + e toggles
+set -g @agent_sidebar_width '34'
 ```
 
 Or run it in any pane directly:
 
 ```sh
-./claude-sidebar            # live
-./claude-sidebar --once     # print one frame and exit
+./agent-sidebar            # live
+./agent-sidebar --once     # print one frame and exit
 ```
 
 ## What it does not do

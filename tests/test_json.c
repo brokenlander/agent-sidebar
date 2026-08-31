@@ -175,7 +175,7 @@ static void t_render_widths(void)
 
 int main(void)
 {
-	printf("claude-sidebar tests\n");
+	printf("agent-sidebar tests\n");
 	t_scalars();
 	t_nested_skipped();
 	t_escapes();

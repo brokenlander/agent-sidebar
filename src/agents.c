@@ -291,9 +291,9 @@ static void park_path(char *dst, size_t cap)
 	const char *home = getenv("HOME");
 
 	if (xdg != NULL && *xdg != '\0')
-		snprintf(dst, cap, "%s/claude-sidebar/parked", xdg);
+		snprintf(dst, cap, "%s/agent-sidebar/parked", xdg);
 	else
-		snprintf(dst, cap, "%s/.local/state/claude-sidebar/parked",
+		snprintf(dst, cap, "%s/.local/state/agent-sidebar/parked",
 			 home != NULL ? home : ".");
 }
 

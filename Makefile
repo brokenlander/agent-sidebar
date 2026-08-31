@@ -5,7 +5,7 @@ PREFIX  ?= $(HOME)/.local
 
 SRC  := src/json.c src/agents.c src/render.c
 MAIN := src/main.c
-BIN  := claude-sidebar
+BIN  := agent-sidebar
 
 .PHONY: all clean test sanitize install
 

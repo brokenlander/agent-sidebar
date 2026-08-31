@@ -264,7 +264,7 @@ static void open_menu(const agent *a)
 	if (!safe_token(a->sess))
 		return;
 
-	const char *self = getenv("CLAUDE_SIDEBAR_BIN");
+	const char *self = getenv("AGENT_SIDEBAR_BIN");
 	char selfbuf[512];
 	if (self == NULL) {
 		ssize_t r = readlink("/proc/self/exe", selfbuf,
@@ -298,7 +298,7 @@ static void open_menu(const agent *a)
 /* SGR mouse reports look like ESC [ < button ; col ; row M (press). */
 static void trace(const char *fmt, ...)
 {
-	const char *path = getenv("CLAUDE_SIDEBAR_TRACE");
+	const char *path = getenv("AGENT_SIDEBAR_TRACE");
 	if (path == NULL)
 		return;
 
@@ -393,10 +393,10 @@ static void park_rename(const char *old, const char *new_name)
 
 static void usage(void)
 {
-	fputs("claude-sidebar - live status of every Claude Code agent\n\n"
-	      "  claude-sidebar            run in a tmux pane (live)\n"
-	      "  claude-sidebar --once     print one frame and exit\n"
-	      "  claude-sidebar --width N  force a width (with --once)\n",
+	fputs("agent-sidebar - live status of every Claude Code agent\n\n"
+	      "  agent-sidebar            run in a tmux pane (live)\n"
+	      "  agent-sidebar --once     print one frame and exit\n"
+	      "  agent-sidebar --width N  force a width (with --once)\n",
 	      stderr);
 }
 
@@ -425,14 +425,14 @@ int main(int argc, char **argv)
 	}
 	if (argc >= 4 && strcmp(argv[1], "--rename-session") == 0) {
 		if (argv[3][0] == '\0') {
-			notify("claude-sidebar: rename needs a name");
+			notify("agent-sidebar: rename needs a name");
 			return 2;
 		}
 		char *rn[] = { (char *)"tmux", (char *)"rename-session",
 			       (char *)"-t", argv[2], (char *)"--", argv[3],
 			       NULL };
 		if (run_tmux(rn) != 0) {
-			notify("claude-sidebar: rename failed");
+			notify("agent-sidebar: rename failed");
 			return 1;
 		}
 		park_rename(argv[2], argv[3]);
@@ -473,7 +473,7 @@ int main(int argc, char **argv)
 	if (once) {
 		int n = agents_load(agents, AGENT_MAX);
 		if (n < 0) {
-			fputs("claude-sidebar: cannot read the sessions "
+			fputs("agent-sidebar: cannot read the sessions "
 			      "directory\n", stderr);
 			return 1;
 		}
