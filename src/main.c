@@ -297,7 +297,7 @@ static void open_menu(const agent *a)
 		 "'Jump to' j \"run-shell '%s --jump %s'\" "
 		 "'%s' p \"run-shell '%s --park %s'\" "
 		 "'' "
-		 "'Rename' r \"command-prompt -I '%s' "
+		 "'Rename' r \"command-prompt -p 'rename to:' -I '%s' "
 		 "{ run-shell '%s --rename-session %s \\\"%%%%\\\"' }\" "
 		 "2>/dev/null &",  /* backgrounded: display-menu blocks while the
 				      menu is up, and the render loop must not */
