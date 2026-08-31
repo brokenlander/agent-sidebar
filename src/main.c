@@ -325,7 +325,6 @@ static void open_menu(const agent *a)
 		signal(SIGCHLD, SIG_IGN); /* reap without blocking */
 }
 
-/* SGR mouse reports look like ESC [ < button ; col ; row M (press). */
 static void trace(const char *fmt, ...)
 {
 	const char *path = getenv("AGENT_SIDEBAR_TRACE");
@@ -344,69 +343,93 @@ static void trace(const char *fmt, ...)
 	fclose(fp);
 }
 
+/* SGR mouse reports look like ESC [ < button ; col ; row M (press).
+ *
+ * A terminal is a byte stream, not a message stream: over SSH one report can
+ * arrive split across two reads. An earlier version parsed whatever a single
+ * read contained and discarded the rest, so a split report was silently lost
+ * and the click had to be repeated. Unconsumed bytes are now carried over.
+ */
+static char in_buf[4096];
+static size_t in_len;
+
+static void act_on_click(const frame *f, const agent *a, int n, int button,
+			 int row)
+{
+	if ((button & 32) != 0)  /* drag */
+		return;
+	if ((button & 64) != 0)  /* wheel */
+		return;
+
+	int which_button = button & 3;
+	if (which_button > 2)
+		return;
+
+	int idx = row - 1;
+	if (idx < 0 || idx >= f->rows)
+		return;
+	int which = f->row_agent[idx];
+	trace("click button=%d row=%d -> agent %d", which_button, row, which);
+	if (which < 0 || which >= n)
+		return;
+
+	if (which_button == 0)
+		jump_to(&a[which]);
+	else if (which_button == 1)
+		open_menu(&a[which]);
+	else
+		agents_park_toggle(a[which].sess);
+}
+
 static void handle_input(const frame *f, const agent *a, int n)
 {
-	char buf[1024];
-	ssize_t r = read(STDIN_FILENO, buf, sizeof buf - 1);
+	ssize_t r = read(STDIN_FILENO, in_buf + in_len,
+			 sizeof in_buf - 1 - in_len);
 
-	if (r <= 0) {
-		trace("read returned %zd", r);
+	if (r <= 0)
 		return;
-	}
-	buf[r] = '\0';
+	in_len += (size_t)r;
 
-	{
-		char hex[256];
-		size_t o = 0;
-		for (ssize_t k = 0; k < r && o + 4 < sizeof hex; k++)
-			o += (size_t)snprintf(hex + o, sizeof hex - o, "%02x ",
-					      (unsigned char)buf[k]);
-		trace("stdin %zd bytes: %s", r, hex);
-	}
-
-	for (ssize_t i = 0; i + 3 < r; i++) {
-		if (buf[i] != '\033' || buf[i + 1] != '[' || buf[i + 2] != '<')
+	size_t i = 0;
+	while (i < in_len) {
+		if (in_buf[i] != '\033') {
+			i++;
 			continue;
-
-		int button, col, row;
-		char kind;
-		if (sscanf(buf + i + 3, "%d;%d;%d%c", &button, &col, &row,
-			   &kind) != 4)
-			continue;
-		(void)col;
-
-		if (kind != 'M')      /* release */
-			continue;
-		if ((button & 32) != 0) /* drag */
-			continue;
-		if ((button & 64) != 0) /* wheel */
-			continue;
-		int which_button = button & 3;
-		if (which_button > 2)
-			continue; /* left jumps; middle and right both park */
-
-		int idx = row - 1;
-		if (idx < 0 || idx >= f->rows)
-			continue;
-		int which = f->row_agent[idx];
-		trace("click button=%d row=%d -> agent %d", which_button, row,
-		      which);
-		if (which < 0 || which >= n)
-			return;
-
-		if (which_button == 0) {
-			trace("jump to sess=%s pane=%s", a[which].sess,
-			      a[which].pane_id);
-			jump_to(&a[which]);
-		} else if (which_button == 1) {
-			trace("menu for sess=%s", a[which].sess);
-			open_menu(&a[which]);
-		} else {
-			trace("park toggle sess=%s", a[which].sess);
-			agents_park_toggle(a[which].sess);
 		}
-		return;
+		if (i + 2 >= in_len)
+			break; /* too short to classify yet - keep it */
+		if (in_buf[i + 1] != '[' || in_buf[i + 2] != '<') {
+			i++;
+			continue;
+		}
+
+		size_t j = i + 3;
+		while (j < in_len && in_buf[j] != 'M' && in_buf[j] != 'm')
+			j++;
+		if (j >= in_len)
+			break; /* terminator not here yet - keep from i */
+
+		if (in_buf[j] == 'M') { /* press; releases are ignored */
+			int button, col, row;
+			char save = in_buf[j];
+			in_buf[j] = '\0';
+			if (sscanf(in_buf + i + 3, "%d;%d;%d", &button, &col,
+				   &row) == 3) {
+				(void)col;
+				act_on_click(f, a, n, button, row);
+			}
+			in_buf[j] = save;
+		}
+		i = j + 1;
 	}
+
+	/* carry the tail; a report that never completes must not wedge us */
+	if (i > 0 && i <= in_len) {
+		memmove(in_buf, in_buf + i, in_len - i);
+		in_len -= i;
+	}
+	if (in_len + 1 >= sizeof in_buf)
+		in_len = 0;
 }
 
 /* Rewrites the park entry when a session is renamed, so a parked agent does
