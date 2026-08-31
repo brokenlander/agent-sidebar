@@ -7,7 +7,7 @@ BIN="$DIR/agent-sidebar"
 win="${1:-}"
 
 width="$(tmux show-option -gqv @agent_sidebar_width)"
-[ -z "$width" ] && width=34
+[ -z "$width" ] && width=28
 
 existing="$(tmux list-panes -t "$win" -F '#{pane_id} #{pane_current_command}' 2>/dev/null |
 	awk '$2 == "agent-sidebar" { print $1; exit }')"

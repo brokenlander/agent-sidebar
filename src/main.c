@@ -190,6 +190,7 @@ static int capture_tmux(char *const argv[], char *out, size_t cap)
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
+
 /* Failures used to be swallowed by 2>/dev/null, which made a rejected rename
    look like a crash. Say so on the status line instead. */
 static void notify(const char *msg)
@@ -197,21 +198,6 @@ static void notify(const char *msg)
 	char *argv[] = { (char *)"tmux", (char *)"display-message",
 			 (char *)"--", (char *)msg, NULL };
 	run_tmux(argv);
-}
-
-static int safe_token(const char *s)
-{
-	if (*s == '\0')
-		return 0;
-	for (; *s != '\0'; s++) {
-		if ((*s >= 'A' && *s <= 'Z') || (*s >= 'a' && *s <= 'z') ||
-		    (*s >= '0' && *s <= '9') || *s == '.' || *s == '_' ||
-		    *s == '-' || *s == '%' || *s == '@' || *s == ':' ||
-		    *s == '/')
-			continue;
-		return 0;
-	}
-	return 1;
 }
 
 static const char *my_session(void)
@@ -277,11 +263,9 @@ static void jump_to(const agent *a)
    sidebar needs no menu widget of its own. */
 static void open_menu(const agent *a)
 {
-	if (!safe_token(a->sess))
-		return;
-
 	const char *self = getenv("AGENT_SIDEBAR_BIN");
 	char selfbuf[512];
+
 	if (self == NULL) {
 		ssize_t r = readlink("/proc/self/exe", selfbuf,
 				     sizeof selfbuf - 1);
@@ -291,24 +275,38 @@ static void open_menu(const agent *a)
 		self = selfbuf;
 	}
 
-	char cmd[4096];
-	snprintf(cmd, sizeof cmd,
-		 "tmux display-menu -T ' #[align=centre]%s ' -x P -y P "
-		 "'Jump to' j \"run-shell '%s --jump %s'\" "
-		 "'%s' p \"run-shell '%s --park %s'\" "
-		 "'' "
-		 "'Rename' r \"command-prompt -p 'rename to:' -I '%s' "
-		 "{ run-shell '%s --rename-session %s \\\"%%%%\\\"' }\" "
-		 "2>/dev/null &",  /* backgrounded: display-menu blocks while the
-				      menu is up, and the render loop must not */
-		 a->sess, self, a->sess,
-		 a->parked ? "Un-park" : "Park",
-		 self, a->sess,
-		 a->sess, self, a->sess);
+	char title[128], jump[640], park[640], rename[900], pid[32];
+	snprintf(pid, sizeof pid, "%lld", a->pid);
+	snprintf(title, sizeof title, " #[align=centre]%s ", a->sess);
+	snprintf(jump, sizeof jump, "run-shell '%s --jump %s'", self, pid);
+	snprintf(park, sizeof park, "run-shell '%s --park %s'", self, pid);
+	/* the typed name is the only thing a shell sees, and it stays quoted */
+	snprintf(rename, sizeof rename,
+		 "command-prompt -p 'rename to:' -I '%s' "
+		 "{ run-shell '%s --rename-session %s \"%%%%\"' }",
+		 a->sess, self, pid);
 
-	trace("menu cmd: %s", cmd);
-	int rc = system(cmd);
-	trace("menu rc=%d", rc);
+	char *argv[] = {
+		(char *)"tmux", (char *)"display-menu",
+		(char *)"-T", title, (char *)"-x", (char *)"P",
+		(char *)"-y", (char *)"P",
+		(char *)"Jump to", (char *)"j", jump,
+		(char *)(a->parked ? "Un-park" : "Park"), (char *)"p", park,
+		(char *)"", (char *)"", (char *)"",
+		(char *)"Rename", (char *)"r", rename,
+		NULL,
+	};
+
+	trace("menu for sess=%s pid=%s", a->sess, pid);
+	/* display-menu blocks while the menu is up when called from inside the
+	   same client, so it must not be waited on */
+	pid_t child = fork();
+	if (child == 0) {
+		execvp("tmux", argv);
+		_exit(127);
+	}
+	if (child > 0)
+		signal(SIGCHLD, SIG_IGN); /* reap without blocking */
 }
 
 /* SGR mouse reports look like ESC [ < button ; col ; row M (press). */
@@ -397,6 +395,18 @@ static void handle_input(const frame *f, const agent *a, int n)
 
 /* Rewrites the park entry when a session is renamed, so a parked agent does
    not silently un-park because its key changed. */
+/* Actions run as a separate short-lived process, so they reload state. */
+static agent *agent_by_pid(long long pid)
+{
+	static agent list[AGENT_MAX];
+	int n = agents_load(list, AGENT_MAX);
+
+	for (int i = 0; i < n; i++)
+		if (list[i].pid == pid)
+			return &list[i];
+	return NULL;
+}
+
 static void park_rename(const char *old, const char *new_name)
 {
 	/* Consult the park list itself: the session may have no running agent
@@ -425,33 +435,36 @@ int main(int argc, char **argv)
 	int debug = 0;
 
 	/* Actions, invoked by tmux menu items rather than by a person. */
+	/* These take a pid, not a session name. A pid is always digits, so
+	   nothing needs quoting when tmux menu items invoke them - a session
+	   called "PR-3 BYO" broke every name-keyed action. */
 	if (argc >= 3 && strcmp(argv[1], "--park") == 0) {
-		agents_park_toggle(argv[2]);
+		agent *found = agent_by_pid(atoll(argv[2]));
+		if (found != NULL)
+			agents_park_toggle(found->sess);
 		return 0;
 	}
 	if (argc >= 3 && strcmp(argv[1], "--jump") == 0) {
-		agent list[AGENT_MAX];
-		int n = agents_load(list, AGENT_MAX);
-		for (int i = 0; i < n; i++)
-			if (strcmp(list[i].sess, argv[2]) == 0) {
-				jump_to(&list[i]);
-				break;
-			}
+		agent *found = agent_by_pid(atoll(argv[2]));
+		if (found != NULL)
+			jump_to(found);
 		return 0;
 	}
 	if (argc >= 4 && strcmp(argv[1], "--rename-session") == 0) {
+		agent *found = agent_by_pid(atoll(argv[2]));
+		const char *old = found != NULL ? found->sess : argv[2];
 		if (argv[3][0] == '\0') {
 			notify("agent-sidebar: rename needs a name");
 			return 2;
 		}
 		char *rn[] = { (char *)"tmux", (char *)"rename-session",
-			       (char *)"-t", argv[2], (char *)"--", argv[3],
-			       NULL };
+			       (char *)"-t", (char *)old, (char *)"--",
+			       argv[3], NULL };
 		if (run_tmux(rn) != 0) {
 			notify("agent-sidebar: rename failed");
 			return 1;
 		}
-		park_rename(argv[2], argv[3]);
+		park_rename(old, argv[3]);
 
 		/* wake any running sidebar rather than making it wait out the
 		   pane-map TTL */
