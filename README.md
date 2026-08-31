@@ -21,9 +21,14 @@ on differently. Sorted so whatever needs you is at the top.
 
 - **Left-click a row** to jump to that agent: the client looking at the sidebar
   switches session, window and pane in one go.
-- **Right-click or middle-click a row** to park it. Parked agents sink below
-  everything else, whatever they are doing, and render as a hollow dimmed dot.
-  Click again to bring one back.
+- **Middle-click a row** for a menu: jump, park/un-park, or rename the tmux
+  session. tmux renders the menu itself via `display-menu`, so there is no menu
+  widget here - just a command string. Rename pre-fills the current name and
+  moves the park entry with it, so a parked agent does not un-park because its
+  key changed.
+- **Right-click a row** to park it directly, without the menu. Parked agents sink below
+  Parked agents sink below everything else, whatever they are doing, and render
+  as a hollow dimmed dot. Click again to bring one back.
 
 Parking is per tmux session name and survives restarts, in
 `$XDG_STATE_HOME/claude-sidebar/parked` (default `~/.local/state/...`). It is a

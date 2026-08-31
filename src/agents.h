@@ -33,4 +33,7 @@ const char *agent_status_label(agent_status s);
    $XDG_STATE_HOME/claude-sidebar/parked (default ~/.local/state/...). */
 void agents_park_toggle(const char *sess);
 
+/* True when the name is on the park list, whether or not it is running. */
+int agents_park_has(const char *sess);
+
 #endif

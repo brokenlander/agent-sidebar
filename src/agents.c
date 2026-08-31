@@ -363,6 +363,12 @@ static int park_contains(const char *sess)
 	return 0;
 }
 
+int agents_park_has(const char *sess)
+{
+	park_load();
+	return park_contains(sess);
+}
+
 void agents_park_toggle(const char *sess)
 {
 	char path[512];

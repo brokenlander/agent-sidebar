@@ -181,6 +181,44 @@ static void jump_to(const agent *a)
 	trace("jump rc=%d", rc);
 }
 
+/* tmux renders the menu, handles its keys and runs the chosen command, so the
+   sidebar needs no menu widget of its own. */
+static void open_menu(const agent *a)
+{
+	if (!safe_token(a->sess))
+		return;
+
+	const char *self = getenv("CLAUDE_SIDEBAR_BIN");
+	char selfbuf[512];
+	if (self == NULL) {
+		ssize_t r = readlink("/proc/self/exe", selfbuf,
+				     sizeof selfbuf - 1);
+		if (r <= 0)
+			return;
+		selfbuf[r] = '\0';
+		self = selfbuf;
+	}
+
+	char cmd[4096];
+	snprintf(cmd, sizeof cmd,
+		 "tmux display-menu -T ' #[align=centre]%s ' -x P -y P "
+		 "'Jump to' j \"run-shell '%s --jump %s'\" "
+		 "'%s' p \"run-shell '%s --park %s'\" "
+		 "'' "
+		 "'Rename' r \"command-prompt -I '%s' "
+		 "{ run-shell '%s --rename-session %s \\\"%%%%\\\"' }\" "
+		 "2>/dev/null &",  /* backgrounded: display-menu blocks while the
+				      menu is up, and the render loop must not */
+		 a->sess, self, a->sess,
+		 a->parked ? "Un-park" : "Park",
+		 self, a->sess,
+		 a->sess, self, a->sess);
+
+	trace("menu cmd: %s", cmd);
+	int rc = system(cmd);
+	trace("menu rc=%d", rc);
+}
+
 /* SGR mouse reports look like ESC [ < button ; col ; row M (press). */
 static void trace(const char *fmt, ...)
 {
@@ -254,12 +292,27 @@ static void handle_input(const frame *f, const agent *a, int n)
 			trace("jump to sess=%s pane=%s", a[which].sess,
 			      a[which].pane_id);
 			jump_to(&a[which]);
+		} else if (which_button == 1) {
+			trace("menu for sess=%s", a[which].sess);
+			open_menu(&a[which]);
 		} else {
 			trace("park toggle sess=%s", a[which].sess);
 			agents_park_toggle(a[which].sess);
 		}
 		return;
 	}
+}
+
+/* Rewrites the park entry when a session is renamed, so a parked agent does
+   not silently un-park because its key changed. */
+static void park_rename(const char *old, const char *new_name)
+{
+	/* Consult the park list itself: the session may have no running agent
+	   yet still be parked, and a live-agent lookup would miss it. */
+	if (!agents_park_has(old))
+		return;
+	agents_park_toggle(old);       /* drop the stale key */
+	agents_park_toggle(new_name);  /* add the new one */
 }
 
 static void usage(void)
@@ -278,6 +331,34 @@ int main(int argc, char **argv)
 	int once = 0;
 	int force_width = 0;
 	int debug = 0;
+
+	/* Actions, invoked by tmux menu items rather than by a person. */
+	if (argc >= 3 && strcmp(argv[1], "--park") == 0) {
+		agents_park_toggle(argv[2]);
+		return 0;
+	}
+	if (argc >= 3 && strcmp(argv[1], "--jump") == 0) {
+		agent list[AGENT_MAX];
+		int n = agents_load(list, AGENT_MAX);
+		for (int i = 0; i < n; i++)
+			if (strcmp(list[i].sess, argv[2]) == 0) {
+				jump_to(&list[i]);
+				break;
+			}
+		return 0;
+	}
+	if (argc >= 4 && strcmp(argv[1], "--rename-session") == 0) {
+		if (!safe_token(argv[2]) || !safe_token(argv[3]))
+			return 2;
+		char cmd[512];
+		snprintf(cmd, sizeof cmd,
+			 "tmux rename-session -t '%s' -- '%s' 2>/dev/null",
+			 argv[2], argv[3]);
+		int rc = system(cmd);
+		(void)rc;
+		park_rename(argv[2], argv[3]);
+		return 0;
+	}
 
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--once") == 0) {
