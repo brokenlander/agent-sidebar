@@ -539,7 +539,8 @@ static void usage(void)
 	fputs("agent-sidebar - live status of every Claude Code agent\n\n"
 	      "  agent-sidebar            run in a tmux pane (live)\n"
 	      "  agent-sidebar --once     print one frame and exit\n"
-	      "  agent-sidebar --width N  force a width (with --once)\n",
+	      "  agent-sidebar --width N  force a width (with --once)\n"
+	      "  agent-sidebar --rows N   force a height (with --once)\n",
 	      stderr);
 }
 
@@ -549,6 +550,7 @@ int main(int argc, char **argv)
 	static frame cur, prev;
 	int once = 0;
 	int force_width = 0;
+	int force_rows = 0;
 	int debug = 0;
 
 	/* Actions, invoked by tmux menu items rather than by a person. */
@@ -568,8 +570,15 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	if (argc >= 4 && strcmp(argv[1], "--rename-session") == 0) {
+		/* No fallback to argv[2] as a session name: a pid that matches
+		   no agent was being handed to tmux as a target, which resolved
+		   to an unrelated session and renamed it. Refuse instead. */
 		agent *found = agent_by_pid(atoll(argv[2]));
-		const char *old = found != NULL ? found->sess : argv[2];
+		if (found == NULL || found->sess[0] == '\0') {
+			notify("agent-sidebar: no agent with that pid");
+			return 2;
+		}
+		const char *old = found->sess;
 		if (argv[3][0] == '\0') {
 			notify("agent-sidebar: rename needs a name");
 			return 2;
@@ -598,6 +607,8 @@ int main(int argc, char **argv)
 			debug = 1;
 		} else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
 			force_width = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--rows") == 0 && i + 1 < argc) {
+			force_rows = atoi(argv[++i]);
 		} else {
 			usage();
 			return 2;
@@ -632,7 +643,9 @@ int main(int argc, char **argv)
 			      "directory\n", stderr);
 			return 1;
 		}
-		render_build(&cur, agents, n, cols, FRAME_ROWS, now_ms());
+		render_build(&cur, agents, n, cols,
+			     force_rows > 0 ? force_rows : FRAME_ROWS,
+			     now_ms());
 		for (int i = 0; i < cur.rows; i++)
 			printf("%s\033[0m\n", cur.line[i]);
 		return 0;

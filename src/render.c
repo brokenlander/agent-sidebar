@@ -188,8 +188,20 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 	lb_raw(&lb, C_RESET);
 	put_line(f, &lb, -1);
 
-	/* one row per agent: dot, identifier, right-aligned age */
-	for (int i = 0; i < n && f->rows < rows; i++) {
+	/* One row per agent. When they do not fit, the last line says how many
+	   are hidden: silently dropping them would look like they had been
+	   deleted, and the ones that vanish are the bottom of the sort, which
+	   is exactly where parked agents live. */
+	int room = rows - f->rows;
+	int shown = n;
+	if (room < 1)
+		room = 1;
+	if (n > room)
+		shown = room - 1; /* keep a line for the count */
+	if (shown < 0)
+		shown = 0;
+
+	for (int i = 0; i < shown; i++) {
 		const agent *g = &a[i];
 		char age[16];
 		fmt_age(age, sizeof age, now_ms, g->seen_ms);
@@ -229,6 +241,16 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 		lb_text(&lb, age);
 		lb_raw(&lb, C_RESET);
 		put_line(f, &lb, i);
+	}
+
+	if (shown < n) {
+		char t[32];
+		snprintf(t, sizeof t, " +%d more", n - shown);
+		lb_init(&lb, cols);
+		lb_raw(&lb, C_DIM);
+		lb_text(&lb, t);
+		lb_raw(&lb, C_RESET);
+		put_line(f, &lb, -1);
 	}
 
 	if (n == 0) {

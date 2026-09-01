@@ -22,6 +22,7 @@ test: tests/test_json.c $(SRC)
 	@/tmp/cs-test
 	@command -v node >/dev/null && node tests/test_opencode_plugin.mjs || \
 		echo "  SKIP  opencode producer tests (node not found)"
+	@bash tests/integration.sh
 
 sanitize: $(SRC) $(MAIN)
 	$(CC) -std=c17 -g -O1 -Wall -Wextra -fsanitize=address,undefined \
