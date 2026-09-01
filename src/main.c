@@ -314,15 +314,25 @@ static void open_menu(const agent *a)
 	};
 
 	trace("menu for sess=%s pid=%s", a->sess, pid);
+
 	/* display-menu blocks while the menu is up when called from inside the
-	   same client, so it must not be waited on */
+	   same client, so it must not be waited on. Double-fork rather than
+	   ignoring SIGCHLD: that disposition is process-wide and permanent, and
+	   it silently broke every later waitpid in run_tmux. */
 	pid_t child = fork();
 	if (child == 0) {
-		execvp("tmux", argv);
-		_exit(127);
+		pid_t grandchild = fork();
+		if (grandchild == 0) {
+			execvp("tmux", argv);
+			_exit(127);
+		}
+		_exit(0); /* orphan it; init reaps the grandchild */
 	}
-	if (child > 0)
-		signal(SIGCHLD, SIG_IGN); /* reap without blocking */
+	if (child > 0) {
+		int st;
+		while (waitpid(child, &st, 0) < 0 && errno == EINTR)
+			; /* the intermediate child exits at once */
+	}
 }
 
 static void trace(const char *fmt, ...)
@@ -383,6 +393,12 @@ static void act_on_click(const frame *f, const agent *a, int n, int button,
 
 static void handle_input(const frame *f, const agent *a, int n)
 {
+	/* A full buffer would make the read below ask for zero bytes, return 0,
+	   and take the early exit forever - clicks would stop for good. Nothing
+	   this long can be a pending mouse report, so drop it. */
+	if (in_len + 1 >= sizeof in_buf)
+		in_len = 0;
+
 	ssize_t r = read(STDIN_FILENO, in_buf + in_len,
 			 sizeof in_buf - 1 - in_len);
 

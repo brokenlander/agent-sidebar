@@ -5,6 +5,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -143,23 +144,76 @@ struct ttyrow {
 
 /* One `tmux list-panes` for the whole fleet, cached, and only ever run when
    some agent is missing its pane. Keeps the steady state off the tmux server. */
+/* Reads tmux's output without a shell. popen would spawn /bin/sh purely to
+   exec tmux, doubling the process count for no benefit. */
+static int tmux_capture(char *const argv[], char *out, size_t cap)
+{
+	int fds[2];
+
+	if (cap == 0 || pipe(fds) != 0)
+		return -1;
+	out[0] = '\0';
+
+	pid_t pid = fork();
+	if (pid < 0) {
+		close(fds[0]);
+		close(fds[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		close(fds[0]);
+		dup2(fds[1], STDOUT_FILENO);
+		close(fds[1]);
+		int null = open("/dev/null", O_WRONLY);
+		if (null >= 0) {
+			dup2(null, STDERR_FILENO);
+			close(null);
+		}
+		execvp("tmux", argv);
+		_exit(127);
+	}
+
+	close(fds[1]);
+	size_t got = 0;
+	while (got < cap - 1) {
+		ssize_t r = read(fds[0], out + got, cap - 1 - got);
+		if (r < 0 && errno == EINTR)
+			continue;
+		if (r <= 0)
+			break;
+		got += (size_t)r;
+	}
+	close(fds[0]);
+	out[got] = '\0';
+
+	int st = 0;
+	while (waitpid(pid, &st, 0) < 0)
+		if (errno != EINTR)
+			return -1;
+	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+/* One tmux call for the whole fleet, cached, so the steady state stays off
+   the server. */
 static int tty_map_load(struct ttyrow *rows, int cap)
 {
-	FILE *fp = popen("tmux list-panes -a -F "
-			 "'#{pane_tty}\t#{session_name}\t"
-			 "#{session_name}:#{window_index}.#{pane_index}\t"
-			 "#{pane_id}' "
-			 "2>/dev/null", "r");
-	if (fp == NULL)
+	static char out[65536];
+	char *argv[] = {
+		(char *)"tmux", (char *)"list-panes", (char *)"-a",
+		(char *)"-F",
+		(char *)"#{pane_tty}\t#{session_name}\t"
+			"#{session_name}:#{window_index}.#{pane_index}\t"
+			"#{pane_id}",
+		NULL,
+	};
+
+	if (tmux_capture(argv, out, sizeof out) != 0)
 		return 0;
 
-	char line[512];
 	int n = 0;
-	while (n < cap && fgets(line, sizeof line, fp) != NULL) {
-		char *nl = strchr(line, '\n');
-		if (nl != NULL)
-			*nl = '\0';
-
+	char *save = NULL;
+	for (char *line = strtok_r(out, "\n", &save);
+	     line != NULL && n < cap; line = strtok_r(NULL, "\n", &save)) {
 		char *t1 = strchr(line, '\t');
 		if (t1 == NULL)
 			continue;
@@ -183,7 +237,6 @@ static int tty_map_load(struct ttyrow *rows, int cap)
 			 t3 != NULL ? t3 + 1 : "");
 		n++;
 	}
-	pclose(fp);
 	return n;
 }
 
