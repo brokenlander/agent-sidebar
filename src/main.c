@@ -129,6 +129,15 @@ static int run_tmux(char *const argv[])
 	if (pid < 0)
 		return -1;
 	if (pid == 0) {
+		/* Errors reach the user through notify() and exit codes. Left
+		   inherited, tmux's stderr would be printed into the sidebar's
+		   own pane and corrupt the display - a has-session probe alone
+		   writes "can't find session" every time. */
+		int null = open("/dev/null", O_WRONLY);
+		if (null >= 0) {
+			dup2(null, STDERR_FILENO);
+			close(null);
+		}
 		execvp("tmux", argv);
 		_exit(127);
 	}
@@ -284,11 +293,18 @@ static void open_menu(const agent *a)
 		self = selfbuf;
 	}
 
-	char title[128], jump[640], park[640], rename[900], killc[900], pid[32];
+	char title[128], jump[640], park[640], rename[900], killc[900];
+	char newc[900], pid[32];
 	snprintf(pid, sizeof pid, "%lld", a->pid);
 	snprintf(title, sizeof title, " #[align=centre]%s ", a->sess);
 	snprintf(jump, sizeof jump, "run-shell '%s --jump %s'", self, pid);
 	snprintf(park, sizeof park, "run-shell '%s --park %s'", self, pid);
+	/* start another agent in the same directory as this one */
+	snprintf(newc, sizeof newc,
+		 "command-prompt -p 'new agent in:' -I '%s' "
+		 "\"run-shell '%s --new \\\"%%%%\\\"'\"",
+		 a->cwd, self);
+
 	/* tmux asks for confirmation itself, so there is no dialog to build */
 	snprintf(killc, sizeof killc,
 		 "confirm-before -p 'kill %s? (y/n)' "
@@ -309,6 +325,7 @@ static void open_menu(const agent *a)
 		(char *)(a->parked ? "Un-park" : "Park"), (char *)"p", park,
 		(char *)"", (char *)"", (char *)"",
 		(char *)"Rename", (char *)"r", rename,
+		(char *)"New agent", (char *)"n", newc,
 		(char *)"Kill", (char *)"k", killc,
 		NULL,
 	};
@@ -569,6 +586,91 @@ int main(int argc, char **argv)
 		agent *found = agent_by_pid(atoll(argv[2]));
 		if (found != NULL)
 			agents_park_toggle(found->sess);
+		return 0;
+	}
+	if (argc >= 3 && strcmp(argv[1], "--new") == 0) {
+		char dir[512];
+
+		/* --list prints paths with $HOME collapsed, so whatever calls
+		   this hands them back that way. */
+		if (argv[2][0] == '~' &&
+		    (argv[2][1] == '/' || argv[2][1] == '\0')) {
+			const char *home = getenv("HOME");
+			snprintf(dir, sizeof dir, "%s%s", home ? home : "",
+				 argv[2] + 1);
+		} else {
+			snprintf(dir, sizeof dir, "%s", argv[2]);
+		}
+
+		struct stat st;
+		if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+			notify("agent-sidebar: not a directory");
+			return 2;
+		}
+
+		char cmd[256] = "";
+		char *opt[] = { (char *)"tmux", (char *)"show-option",
+				(char *)"-gqv",
+				(char *)"@agent_sidebar_new_command", NULL };
+		capture_all(opt, cmd, sizeof cmd);
+		char *nl = strchr(cmd, '\n');
+		if (nl != NULL)
+			*nl = '\0';
+		if (cmd[0] == '\0')
+			snprintf(cmd, sizeof cmd, "claude");
+
+		/* name after the directory, suffixed until it is free */
+		const char *base = strrchr(dir, '/');
+		base = (base != NULL && base[1] != '\0') ? base + 1 : dir;
+
+		char name[128];
+		snprintf(name, sizeof name, "%.*s",
+			 (int)(sizeof name - 5), base);
+		for (int i = 2; i < 100; i++) {
+			char *has[] = { (char *)"tmux", (char *)"has-session",
+					(char *)"-t", (char *)name, NULL };
+			if (run_tmux(has) != 0)
+				break;
+			snprintf(name, sizeof name, "%.*s-%d",
+				 (int)(sizeof name - 8), base, i);
+		}
+
+		char *mk[] = { (char *)"tmux", (char *)"new-session",
+			       (char *)"-d", (char *)"-s", name,
+			       (char *)"-c", dir, cmd, NULL };
+		if (run_tmux(mk) != 0) {
+			notify("agent-sidebar: could not create the session");
+			return 1;
+		}
+
+		/* move the client that asked to the session it just made */
+		char client[128] = "";
+		const char *self_pane = getenv("TMUX_PANE");
+		if (self_pane != NULL && *self_pane != '\0') {
+			char clients[2048];
+			char *lc[] = { (char *)"tmux", (char *)"list-clients",
+				       (char *)"-t", (char *)self_pane,
+				       (char *)"-F", (char *)"#{client_name}",
+				       NULL };
+			if (capture_all(lc, clients, sizeof clients) == 0) {
+				char *e = strchr(clients, '\n');
+				if (e != NULL)
+					*e = '\0';
+				snprintf(client, sizeof client, "%.*s",
+					 (int)(sizeof client - 1), clients);
+			}
+		}
+		if (client[0] != '\0') {
+			char *sw[] = { (char *)"tmux", (char *)"switch-client",
+				       (char *)"-c", client, (char *)"-t",
+				       name, NULL };
+			run_tmux(sw);
+		} else {
+			char *sw[] = { (char *)"tmux", (char *)"switch-client",
+				       (char *)"-t", name, NULL };
+			run_tmux(sw);
+		}
+		trace("new session=%s dir=%s cmd=%s", name, dir, cmd);
 		return 0;
 	}
 	if (argc >= 3 && strcmp(argv[1], "--kill") == 0) {

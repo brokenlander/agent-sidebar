@@ -143,6 +143,23 @@ kill -0 "$bystander" 2>/dev/null \
 	&& check 0 "--kill will not signal a non-agent" || check 1 "--kill will not signal a non-agent"
 kill "$bystander" 2>/dev/null
 
+# --- new ---------------------------------------------------------------------
+$TM set -g @agent_sidebar_new_command "sleep 120"
+mkdir -p "$TMP/fresh"
+sb --new "$TMP/fresh" >/dev/null 2>&1
+sleep 1
+$TM list-sessions -F '#{session_name}' | grep -qx "fresh" \
+	&& check 0 "--new creates a session named for the directory" \
+	|| check 1 "--new creates a session named for the directory"
+[ "$($TM display-message -p -t fresh '#{pane_current_path}' 2>/dev/null)" = "$TMP/fresh" ] \
+	&& check 0 "--new starts it in that directory" || check 1 "--new starts it in that directory"
+sb --new "$TMP/fresh" >/dev/null 2>&1
+sleep 1
+$TM list-sessions -F '#{session_name}' | grep -qx "fresh-2" \
+	&& check 0 "--new suffixes rather than colliding" || check 1 "--new suffixes rather than colliding"
+sb --new "$TMP/not-a-dir" >/dev/null 2>&1
+[ $? -eq 2 ] && check 0 "--new refuses a non-directory" || check 1 "--new refuses a non-directory"
+
 # --- overflow ----------------------------------------------------------------
 sb --once --width 26 --rows 4 | grep -q "more" \
 	&& check 0 "a short pane reports hidden rows" || check 1 "a short pane reports hidden rows"

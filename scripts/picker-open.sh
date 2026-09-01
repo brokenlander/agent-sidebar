@@ -11,19 +11,13 @@ BIN="$DIR/agent-sidebar"
 
 [ -x "$BIN" ] || { tmux display-message "agent-sidebar: not built - run make in $DIR"; exit 0; }
 
-agents=$("$BIN" --list 2>/dev/null | wc -l)
-[ "$agents" -lt 1 ] && agents=1
-
-# list rows + header + fzf's prompt/counter + the popup border
-want=$((agents + 4))
-
-client_h=$(tmux display-message -p '#{client_height}' 2>/dev/null || echo 40)
-max=$((client_h * 90 / 100))
-min=10
-[ "$want" -gt "$max" ] && want=$max
-[ "$want" -lt "$min" ] && want=$min
-
+# Proportional to the client, not to the agent count. Content-sizing was a
+# workaround for fzf occupying only part of the popup; with FZF_DEFAULT_OPTS
+# cleared it fills whatever it is given, so a taller popup simply means a
+# taller preview.
 width="$(tmux show-option -gqv @agent_sidebar_picker_width)"
 [ -z "$width" ] && width='85%'
+height="$(tmux show-option -gqv @agent_sidebar_picker_height)"
+[ -z "$height" ] && height='90%'
 
-tmux display-popup -w "$width" -h "$want" -E "$DIR/scripts/picker.sh"
+tmux display-popup -w "$width" -h "$height" -E "$DIR/scripts/picker.sh"

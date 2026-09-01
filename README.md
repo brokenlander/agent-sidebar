@@ -94,7 +94,20 @@ The trace costs one `getenv` per input event and nothing at all when unset.
 ## The picker
 
 `prefix + g` opens a popup listing every agent, with a live preview of its
-screen. Enter jumps to one, `ctrl-x` kills it, `ctrl-p` parks it.
+screen.
+
+| key | |
+|---|---|
+| `enter` | jump to it |
+| `alt-k` | kill it |
+| `alt-p` | park it |
+| `alt-n` | start a new agent in its directory |
+| `alt-v` | toggle the preview |
+| typing | filters the list |
+
+`alt-` rather than bare letters because fzf's input is a search box, and with a
+fleet of agents that filter earns its keep. The `ctrl-x` and `ctrl-p` forms work
+too. The agent to start is `@agent_sidebar_new_command`, `claude` by default.
 
 The sidebar answers "what is happening"; the picker answers "show me that one"
 without giving up a column of screen. Both read the same loader, so opening the
