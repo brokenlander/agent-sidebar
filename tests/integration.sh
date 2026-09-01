@@ -113,10 +113,16 @@ sb --list | head -1 | awk -F'\t' '{ exit !($1 ~ /^[0-9]+$/ && $2 ~ /^%/) }' \
 
 # --- kill --------------------------------------------------------------------
 victim=$($TM list-panes -t bravo -F '#{pane_pid}' | head -1)
+[ -n "$victim" ] || fail "could not find a victim pid"   # an empty pid would pass vacuously
 sb --kill "$victim" >/dev/null 2>&1
-sleep 2
-kill -0 "$victim" 2>/dev/null \
-	&& check 1 "--kill terminates the agent" || check 0 "--kill terminates the agent"
+# poll rather than sleeping a fixed amount: under load the exit is not instant,
+# and a fixed wait made this check flaky
+gone=1
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	kill -0 "$victim" 2>/dev/null || { gone=0; break; }
+	sleep 0.5
+done
+check "$gone" "--kill terminates the agent"
 
 sb --kill 999999 >/dev/null 2>&1
 [ $? -eq 2 ] && check 0 "--kill refuses an unknown pid" || check 1 "--kill refuses an unknown pid"
