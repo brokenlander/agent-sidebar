@@ -1,10 +1,15 @@
 # agent-sidebar
 
-A tmux sidebar showing every Claude Code agent on the machine: what state it is
-in, which tmux session it lives in, and how long it has been that way.
+A tmux sidebar showing every coding agent on the machine: what state it is in,
+which tmux session it lives in, and how long it has been that way. Click a row
+to jump straight to it.
+
+Supports Claude Code natively and opencode through a small plugin. Written in
+C17 against libc only; a refresh costs about 4ms and an idle sidebar writes
+nothing at all.
 
 ```
- claude                   17
+ agents                   17
  ○ 1  ● 11  ● 5
 ──────────────────────────────
  ● api gateway-api        2m
@@ -26,9 +31,9 @@ on differently. Sorted so whatever needs you is at the top.
   widget here - just a command string. Rename pre-fills the current name and
   moves the park entry with it, so a parked agent does not un-park because its
   key changed.
-- **Right-click a row** to park it directly, without the menu. Parked agents sink below
-  Parked agents sink below everything else, whatever they are doing, and render
-  as a hollow dimmed dot. Click again to bring one back.
+- **Right-click a row** to park it directly, without the menu. Parked agents
+  sink below everything else, whatever they are doing, and render as a hollow
+  dimmed dot. Click again to bring one back.
 
 Parking is per tmux session name and survives restarts, in
 `$XDG_STATE_HOME/agent-sidebar/parked` (default `~/.local/state/...`). It is a
@@ -85,6 +90,36 @@ AGENT_SIDEBAR_TRACE=/tmp/cs.log ./agent-sidebar   # log input and jump commands
 ```
 
 The trace costs one `getenv` per input event and nothing at all when unset.
+
+## Requirements
+
+tmux 3.2 or newer, a C compiler, and libc. Node is needed only to run the
+opencode producer and its tests.
+
+## Quick start
+
+```sh
+make
+./agent-sidebar --once        # print one frame and exit, to see it working
+```
+
+Then load it from `~/.tmux.conf`:
+
+```tmux
+set -g @agent_sidebar_key 'e'      # prefix + e toggles the sidebar
+set -g @agent_sidebar_width '28'
+run-shell -b '/path/to/agent-sidebar/sidebar.tmux'
+```
+
+Claude Code needs no setup - it already writes the state this reads. For
+opencode, symlink the producer into its plugin directory:
+
+```sh
+mkdir -p ~/.config/opencode/plugins
+ln -sf "$PWD/producers/opencode/plugin.js" ~/.config/opencode/plugins/agent-sidebar.js
+```
+
+Restart an agent afterwards; it registers on startup and removes itself on exit.
 
 ## Build
 
