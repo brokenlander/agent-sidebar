@@ -101,13 +101,19 @@ screen.
 | `enter` | jump to it |
 | `alt-k` | kill it |
 | `alt-p` | park it |
-| `alt-n` | start a new agent in its directory |
+| `alt-n` | start another agent of the same kind, in its directory (prompts) |
 | `alt-v` | toggle the preview |
 | typing | filters the list |
 
 `alt-` rather than bare letters because fzf's input is a search box, and with a
 fleet of agents that filter earns its keep. The `ctrl-x` and `ctrl-p` forms work
-too. The agent to start is `@agent_sidebar_new_command`, `claude` by default.
+too.
+
+`alt-n` starts whatever the highlighted row is running - an opencode row starts
+opencode - and prompts with that row's directory first, since starting an agent
+costs real money and the directory depends on where the cursor was. The command
+per kind is `@agent_sidebar_command_claude`, `@agent_sidebar_command_opencode`
+and so on; unset, the kind is the command.
 
 The sidebar answers "what is happening"; the picker answers "show me that one"
 without giving up a column of screen. Both read the same loader, so opening the

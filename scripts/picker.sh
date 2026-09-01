@@ -35,11 +35,11 @@ hdr=$(printf '\033[38;5;110menter\033[0m jump   \033[38;5;110malt-k\033[0m kill 
 
 # Columns: 1 pid, 2 pane id, 3 state, 4 age, 5 session, 6 path.
 # The first two are hidden; they are what the actions key on.
-sel=$("$BIN" --list | fzf --ansi --delimiter='\t' --with-nth=3.. \
+sel=$("$BIN" --list | fzf --ansi --delimiter='\t' --with-nth=3..6 \
 	--reverse --cycle --no-sort --header-first --header="$hdr" \
+	--expect=alt-n \
 	--preview='tmux capture-pane -ept {2} 2>/dev/null || echo "(not in a pane)"' \
 	--preview-window='right,55%,follow,border-left' \
-	--bind="alt-n:execute($BIN --new {6})+abort" \
 	--bind='alt-v:toggle-preview' \
 	--bind='ctrl-/:toggle-preview' \
 	--bind="alt-k:execute-silent($BIN --kill {1})+reload(sleep 0.3; $BIN --list)" \
@@ -48,5 +48,21 @@ sel=$("$BIN" --list | fzf --ansi --delimiter='\t' --with-nth=3.. \
 	--bind="ctrl-p:execute-silent($BIN --park {1})+reload($BIN --list)")
 
 [ -n "$sel" ] || exit 0
-pid=$(printf '%s' "$sel" | cut -f1)
+
+key=$(printf '%s\n' "$sel" | sed -n '1p')
+row=$(printf '%s\n' "$sel" | sed -n '2p')
+[ -n "$row" ] || exit 0
+
+pid=$(printf '%s' "$row" | cut -f1)
+dir=$(printf '%s' "$row" | cut -f6)
+kind=$(printf '%s' "$row" | cut -f7)
+
+if [ "$key" = "alt-n" ]; then
+	# Prompt rather than firing: starting an agent costs real money, and
+	# the target directory comes from wherever the cursor happened to be.
+	tmux command-prompt -p "new $kind agent in:" -I "$dir" \
+		"run-shell \"$BIN --new '%%' $kind\""
+	exit 0
+fi
+
 "$BIN" --jump "$pid"

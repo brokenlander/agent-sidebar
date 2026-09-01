@@ -300,10 +300,11 @@ static void open_menu(const agent *a)
 	snprintf(jump, sizeof jump, "run-shell '%s --jump %s'", self, pid);
 	snprintf(park, sizeof park, "run-shell '%s --park %s'", self, pid);
 	/* start another agent in the same directory as this one */
+	const char *kindlabel = a->agent[0] != '\0' ? a->agent : "claude";
 	snprintf(newc, sizeof newc,
-		 "command-prompt -p 'new agent in:' -I '%s' "
-		 "\"run-shell '%s --new \\\"%%%%\\\"'\"",
-		 a->cwd, self);
+		 "command-prompt -p 'new %s agent in:' -I '%s' "
+		 "\"run-shell '%s --new \\\"%%%%\\\" %s'\"",
+		 kindlabel, a->cwd, self, kindlabel);
 
 	/* tmux asks for confirmation itself, so there is no dialog to build */
 	snprintf(killc, sizeof killc,
@@ -608,16 +609,37 @@ int main(int argc, char **argv)
 			return 2;
 		}
 
+		/* Launch whatever the row was running: an opencode row starts
+		   opencode, anything else starts the default agent. Each is
+		   overridable, e.g. @agent_sidebar_command_opencode. */
+		const char *kind = (argc >= 4 && argv[3][0] != '\0')
+				   ? argv[3] : "claude";
+
+		char optname[96];
+		snprintf(optname, sizeof optname,
+			 "@agent_sidebar_command_%s", kind);
+
 		char cmd[256] = "";
 		char *opt[] = { (char *)"tmux", (char *)"show-option",
-				(char *)"-gqv",
-				(char *)"@agent_sidebar_new_command", NULL };
+				(char *)"-gqv", optname, NULL };
 		capture_all(opt, cmd, sizeof cmd);
 		char *nl = strchr(cmd, '\n');
 		if (nl != NULL)
 			*nl = '\0';
+
+		if (cmd[0] == '\0') {
+			/* the older single-command option still wins if set */
+			char *legacy[] = { (char *)"tmux",
+					   (char *)"show-option", (char *)"-gqv",
+					   (char *)"@agent_sidebar_new_command",
+					   NULL };
+			capture_all(legacy, cmd, sizeof cmd);
+			nl = strchr(cmd, '\n');
+			if (nl != NULL)
+				*nl = '\0';
+		}
 		if (cmd[0] == '\0')
-			snprintf(cmd, sizeof cmd, "claude");
+			snprintf(cmd, sizeof cmd, "%s", kind);
 
 		/* name after the directory, suffixed until it is free */
 		const char *base = strrchr(dir, '/');
@@ -670,7 +692,8 @@ int main(int argc, char **argv)
 				       (char *)"-t", name, NULL };
 			run_tmux(sw);
 		}
-		trace("new session=%s dir=%s cmd=%s", name, dir, cmd);
+		trace("new session=%s dir=%s kind=%s cmd=%s", name, dir,
+		      kind, cmd);
 		return 0;
 	}
 	if (argc >= 3 && strcmp(argv[1], "--kill") == 0) {
@@ -768,7 +791,7 @@ int main(int argc, char **argv)
 				snprintf(age, sizeof age, "%lldd", secs / 86400);
 
 			/* hidden: pid, pane. shown: state, age, session, path */
-			printf("%lld\t%s\t%s%-7s\033[0m\t%5s\t%-18s\t%s\n",
+			printf("%lld\t%s\t%s%-7s\033[0m\t%5s\t%-18s\t%s\t%s\n",
 			       a->pid,
 			       a->pane_id[0] ? a->pane_id : "-",
 			       a->parked ? "\033[38;5;244m"
@@ -777,7 +800,8 @@ int main(int argc, char **argv)
 					 : agent_status_label(a->status),
 			       age,
 			       a->sess[0] ? a->sess : a->name,
-			       a->cwd);
+			       a->cwd,
+			       a->agent[0] != '\0' ? a->agent : "claude");
 		}
 		return 0;
 	}
