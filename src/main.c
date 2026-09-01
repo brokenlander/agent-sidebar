@@ -472,6 +472,75 @@ static void park_rename(const char *old, const char *new_name)
 	agents_park_toggle(new_name);  /* add the new one */
 }
 
+/* Re-exec when our own binary is replaced.
+ *
+ * A rebuilt binary does not reach a running process, so a fixed bug keeps
+ * presenting as broken until someone restarts the pane by hand. The identity
+ * compared is (inode, size, mtime) of the file we were started from - a
+ * rebuild writes a new inode, so this is exact rather than heuristic.
+ *
+ * The change must be seen twice before acting: cc writes the output in place,
+ * so a single sighting can be a half-written file.
+ */
+static char self_path[512];
+static char *const *saved_argv;
+static struct { ino_t ino; off_t size; time_t mtime; } self_id;
+
+static int stat_self(struct stat *st)
+{
+	return self_path[0] != '\0' && stat(self_path, st) == 0;
+}
+
+static void self_record(void)
+{
+	ssize_t r = readlink("/proc/self/exe", self_path, sizeof self_path - 1);
+	struct stat st;
+
+	if (r <= 0) {
+		self_path[0] = '\0';
+		return;
+	}
+	self_path[r] = '\0';
+
+	if (stat_self(&st)) {
+		self_id.ino = st.st_ino;
+		self_id.size = st.st_size;
+		self_id.mtime = st.st_mtime;
+	}
+}
+
+static void self_reexec_if_replaced(void)
+{
+	static ino_t pending_ino;
+	static off_t pending_size;
+	static time_t pending_mtime;
+	struct stat st;
+
+	if (!stat_self(&st))
+		return;
+	if (st.st_ino == self_id.ino && st.st_size == self_id.size &&
+	    st.st_mtime == self_id.mtime)
+		return;
+
+	/* seen once: remember it and wait for the next tick to confirm */
+	if (st.st_ino != pending_ino || st.st_size != pending_size ||
+	    st.st_mtime != pending_mtime) {
+		pending_ino = st.st_ino;
+		pending_size = st.st_size;
+		pending_mtime = st.st_mtime;
+		return;
+	}
+	if (st.st_size == 0 || access(self_path, X_OK) != 0)
+		return;
+
+	trace("re-exec: %s changed", self_path);
+	tty_restore(); /* the successor sets the terminal up again */
+	execv(self_path, saved_argv);
+	/* only reached if exec failed; carry on with the old image */
+	tty_setup();
+	notify("agent-sidebar: could not restart after rebuild");
+}
+
 static void usage(void)
 {
 	fputs("agent-sidebar - live status of every Claude Code agent\n\n"
@@ -541,6 +610,9 @@ int main(int argc, char **argv)
 			return 2;
 		}
 	}
+
+	saved_argv = argv;
+	self_record();
 
 	int cols, rows;
 	term_size(STDOUT_FILENO, &cols, &rows);
@@ -622,6 +694,8 @@ int main(int argc, char **argv)
 			term_size(STDOUT_FILENO, &cols, &rows);
 			force = 1;
 		}
+
+		self_reexec_if_replaced();
 
 		int n = agents_load(agents, AGENT_MAX);
 		if (n < 0)
