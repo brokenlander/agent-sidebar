@@ -16,8 +16,8 @@ BIN="$DIR/agent-sidebar"
 # cleared it fills whatever it is given, so a taller popup simply means a
 # taller preview.
 width="$(tmux show-option -gqv @agent_sidebar_picker_width)"
-[ -z "$width" ] && width='85%'
+[ -z "$width" ] && width='95%'
 height="$(tmux show-option -gqv @agent_sidebar_picker_height)"
-[ -z "$height" ] && height='90%'
+[ -z "$height" ] && height='95%'
 
 tmux display-popup -w "$width" -h "$height" -E "$DIR/scripts/picker.sh"
