@@ -63,6 +63,15 @@ static long long proc_starttime(long long pid)
 		return -1;
 
 	char *p = close_paren + 1;
+
+	/* The token after ')' is the state. A zombie has exited and is merely
+	   waiting to be reaped, so it is not a live agent - without this a
+	   killed agent lingers in the list until its parent gets round to it. */
+	while (*p == ' ')
+		p++;
+	if (*p == 'Z')
+		return -1;
+
 	for (int field = 0; field < 19; field++) {
 		while (*p == ' ')
 			p++;

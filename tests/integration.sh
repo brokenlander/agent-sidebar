@@ -117,12 +117,21 @@ victim=$($TM list-panes -t bravo -F '#{pane_pid}' | head -1)
 sb --kill "$victim" >/dev/null 2>&1
 # poll rather than sleeping a fixed amount: under load the exit is not instant,
 # and a fixed wait made this check flaky
+# kill -0 succeeds on a zombie, so it is not a liveness test: the agent exits
+# but lingers unreaped until tmux gets round to it, which made this flaky.
+dead() {
+	[ -r "/proc/$1/stat" ] || return 0
+	[ "$(awk '{print $3}' "/proc/$1/stat" 2>/dev/null)" = "Z" ]
+}
 gone=1
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-	kill -0 "$victim" 2>/dev/null || { gone=0; break; }
+	dead "$victim" && { gone=0; break; }
 	sleep 0.5
 done
 check "$gone" "--kill terminates the agent"
+
+sb --list | awk -F'\t' -v v="$victim" '$1==v{found=1} END{exit !found}' \
+	&& check 1 "a killed agent leaves the list" || check 0 "a killed agent leaves the list"
 
 sb --kill 999999 >/dev/null 2>&1
 [ $? -eq 2 ] && check 0 "--kill refuses an unknown pid" || check 1 "--kill refuses an unknown pid"
