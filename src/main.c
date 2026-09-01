@@ -140,16 +140,17 @@ static int run_tmux(char *const argv[])
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
-/* Same, capturing the first line of stdout. */
-static int capture_tmux(char *const argv[], char *out, size_t cap)
+/* Capture all of stdout, newlines intact. */
+static int capture_all(char *const argv[], char *out, size_t cap);
+
+/* Capture all of stdout, newlines intact. */
+static int capture_all(char *const argv[], char *out, size_t cap)
 {
 	int fds[2];
 
-	if (cap == 0)
+	if (cap == 0 || pipe(fds) != 0)
 		return -1;
 	out[0] = '\0';
-	if (pipe(fds) != 0)
-		return -1;
 
 	pid_t pid = fork();
 	if (pid < 0) {
@@ -167,22 +168,16 @@ static int capture_tmux(char *const argv[], char *out, size_t cap)
 
 	close(fds[1]);
 	size_t got = 0;
-	for (;;) {
+	while (got < cap - 1) {
 		ssize_t r = read(fds[0], out + got, cap - 1 - got);
 		if (r < 0 && errno == EINTR)
 			continue;
 		if (r <= 0)
 			break;
 		got += (size_t)r;
-		if (got >= cap - 1)
-			break;
 	}
 	close(fds[0]);
 	out[got] = '\0';
-
-	char *nl = strchr(out, '\n');
-	if (nl != NULL)
-		*nl = '\0';
 
 	int st = 0;
 	while (waitpid(pid, &st, 0) < 0)
@@ -190,6 +185,7 @@ static int capture_tmux(char *const argv[], char *out, size_t cap)
 			return -1;
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
+
 
 
 /* Failures used to be swallowed by 2>/dev/null, which made a rejected rename
@@ -201,53 +197,52 @@ static void notify(const char *msg)
 	run_tmux(argv);
 }
 
-static const char *my_session(void)
-{
-	static char cached[128];
-	static int done;
-
-	if (done)
-		return cached;
-	done = 1;
-
-	const char *pane = getenv("TMUX_PANE");
-	if (pane == NULL)
-		return cached;
-
-	char *argv[] = { (char *)"tmux", (char *)"display-message",
-			 (char *)"-p", (char *)"-t", (char *)pane,
-			 (char *)"#{session_name}", NULL };
-	capture_tmux(argv, cached, sizeof cached);
-	return cached;
-}
 
 /* Move the client that is looking at this sidebar to the clicked agent. The
    client is resolved from our own session rather than left to tmux's notion of
    "current", which is ambiguous with several clients attached. */
 static void jump_to(const agent *a)
 {
-	/* The attached client rarely changes, and looking it up cost a whole
-	   round trip on every click. */
-	static char client[128];
-	static time_t client_at;
-	time_t now = time(NULL);
+	char client[128] = "";
 
 	if (a->pane_id[0] == '\0')
 		return;
 
-	if (client[0] == '\0' || now - client_at >= 10) {
-		const char *mine = my_session();
-		if (mine[0] != '\0') {
-			char *lc[] = { (char *)"tmux", (char *)"list-clients",
-				       (char *)"-t", (char *)mine, (char *)"-F",
-				       (char *)"#{client_name}", NULL };
-			capture_tmux(lc, client, sizeof client);
+	/* Key on our own pane id, never the session name: a rename left the
+	   cached name pointing at nothing, the client came back empty, and the
+	   switch fell through to whichever client tmux considered current -
+	   which with several attached is usually a different terminal. Pane ids
+	   do not change, and the lookup is one 4ms call. */
+	const char *self_pane = getenv("TMUX_PANE");
+	if (self_pane != NULL && *self_pane != '\0') {
+		char list[2048];
+		char *lc[] = { (char *)"tmux", (char *)"list-clients",
+			       (char *)"-t", (char *)self_pane, (char *)"-F",
+			       (char *)"#{client_activity} #{client_name}",
+			       NULL };
+		if (capture_all(lc, list, sizeof list) == 0) {
+			/* Two terminals can view one session. Prefer the one
+			   used most recently - it is the one in front of
+			   whoever clicked. */
+			long long best = -1;
+			char *save = NULL;
+			for (char *line = strtok_r(list, "\n", &save);
+			     line != NULL;
+			     line = strtok_r(NULL, "\n", &save)) {
+				char *sp = strchr(line, ' ');
+				if (sp == NULL)
+					continue;
+				*sp = '\0';
+				long long act = atoll(line);
+				if (act > best) {
+					best = act;
+					snprintf(client, sizeof client, "%s",
+						 sp + 1);
+				}
+			}
 		}
-		client_at = now;
 	}
 
-	/* One invocation, one round trip: tmux takes ';' as a command
-	   separator in argv, so switching and focusing happen together. */
 	char *with_client[] = {
 		(char *)"tmux",
 		(char *)"switch-client", (char *)"-c", client,
@@ -268,8 +263,6 @@ static void jump_to(const agent *a)
 	};
 
 	int rc = run_tmux(client[0] != '\0' ? with_client : no_client);
-	if (rc != 0)
-		client[0] = '\0'; /* stale client: re-resolve on the next click */
 
 	trace("jump sess=%s pane=%s client=%s rc=%d", a->sess, a->pane_id,
 	      client, rc);
