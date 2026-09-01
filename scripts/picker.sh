@@ -23,12 +23,21 @@ done
 
 # Columns: 1 pid, 2 pane id, 3 state, 4 age, 5 session, 6 path.
 # The first two are hidden; they are what the actions key on.
+# fzf's own input is a search box, so a bare "k" would type rather than kill.
+# The actions use alt- mnemonics, with ctrl-x kept as an alias.
+hdr=$(printf '\033[38;5;110menter\033[0m jump   \033[38;5;110malt-k\033[0m kill   \033[38;5;110malt-p\033[0m park   \033[38;5;110malt-v\033[0m preview   \033[38;5;110mesc\033[0m close')
+
+# Columns: 1 pid, 2 pane id, 3 state, 4 age, 5 session, 6 path.
+# The first two are hidden; they are what the actions key on.
 sel=$("$BIN" --list | fzf --ansi --delimiter='\t' --with-nth=3.. \
-	--reverse --cycle --no-sort \
-	--header='enter: jump    ctrl-x: kill    ctrl-p: park' \
+	--reverse --cycle --no-sort --header-first --header="$hdr" \
 	--preview='tmux capture-pane -ept {2} 2>/dev/null || echo "(not in a pane)"' \
-	--preview-window='up,70%,follow' \
+	--preview-window='right,55%,follow,border-left' \
+	--bind='alt-v:toggle-preview' \
+	--bind='ctrl-/:toggle-preview' \
+	--bind="alt-k:execute-silent($BIN --kill {1})+reload(sleep 0.3; $BIN --list)" \
 	--bind="ctrl-x:execute-silent($BIN --kill {1})+reload(sleep 0.3; $BIN --list)" \
+	--bind="alt-p:execute-silent($BIN --park {1})+reload($BIN --list)" \
 	--bind="ctrl-p:execute-silent($BIN --park {1})+reload($BIN --list)")
 
 [ -n "$sel" ] || exit 0
