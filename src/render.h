@@ -12,6 +12,9 @@ typedef struct {
 	int rows;
 } frame;
 
+/* The colour a status is drawn in, so other output can match the sidebar. */
+const char *status_colour_for(agent_status s);
+
 void render_build(frame *f, const agent *a, int n, int cols, int rows,
 		  long long now_ms);
 

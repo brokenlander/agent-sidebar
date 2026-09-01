@@ -284,11 +284,17 @@ static void open_menu(const agent *a)
 		self = selfbuf;
 	}
 
-	char title[128], jump[640], park[640], rename[900], pid[32];
+	char title[128], jump[640], park[640], rename[900], killc[900], pid[32];
 	snprintf(pid, sizeof pid, "%lld", a->pid);
 	snprintf(title, sizeof title, " #[align=centre]%s ", a->sess);
 	snprintf(jump, sizeof jump, "run-shell '%s --jump %s'", self, pid);
 	snprintf(park, sizeof park, "run-shell '%s --park %s'", self, pid);
+	/* tmux asks for confirmation itself, so there is no dialog to build */
+	snprintf(killc, sizeof killc,
+		 "confirm-before -p 'kill %s? (y/n)' "
+		 "\"run-shell '%s --kill %s'\"",
+		 a->sess, self, pid);
+
 	/* the typed name is the only thing a shell sees, and it stays quoted */
 	snprintf(rename, sizeof rename,
 		 "command-prompt -p 'rename to:' -I '%s' "
@@ -303,6 +309,7 @@ static void open_menu(const agent *a)
 		(char *)(a->parked ? "Un-park" : "Park"), (char *)"p", park,
 		(char *)"", (char *)"", (char *)"",
 		(char *)"Rename", (char *)"r", rename,
+		(char *)"Kill", (char *)"k", killc,
 		NULL,
 	};
 
@@ -552,6 +559,7 @@ int main(int argc, char **argv)
 	int force_width = 0;
 	int force_rows = 0;
 	int debug = 0;
+	int list = 0;
 
 	/* Actions, invoked by tmux menu items rather than by a person. */
 	/* These take a pid, not a session name. A pid is always digits, so
@@ -561,6 +569,21 @@ int main(int argc, char **argv)
 		agent *found = agent_by_pid(atoll(argv[2]));
 		if (found != NULL)
 			agents_park_toggle(found->sess);
+		return 0;
+	}
+	if (argc >= 3 && strcmp(argv[1], "--kill") == 0) {
+		agent *found = agent_by_pid(atoll(argv[2]));
+		if (found == NULL) {
+			notify("agent-sidebar: no agent with that pid");
+			return 2;
+		}
+		/* SIGTERM the agent, not its session: the pane and whatever
+		   else lives in it survive, and the agent gets to exit
+		   cleanly. */
+		if (kill((pid_t)found->pid, SIGTERM) != 0) {
+			notify("agent-sidebar: could not signal that agent");
+			return 1;
+		}
 		return 0;
 	}
 	if (argc >= 3 && strcmp(argv[1], "--jump") == 0) {
@@ -603,6 +626,8 @@ int main(int argc, char **argv)
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--once") == 0) {
 			once = 1;
+		} else if (strcmp(argv[i], "--list") == 0) {
+			list = 1;
 		} else if (strcmp(argv[i], "--debug") == 0) {
 			debug = 1;
 		} else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
@@ -622,6 +647,38 @@ int main(int argc, char **argv)
 	term_size(STDOUT_FILENO, &cols, &rows);
 	if (force_width > 0)
 		cols = force_width;
+
+	if (list) {
+		int n = agents_load(agents, AGENT_MAX);
+		long long now = now_ms();
+		for (int i = 0; i < n; i++) {
+			const agent *a = &agents[i];
+			long long secs = a->seen_ms > 0
+					 ? (now - a->seen_ms) / 1000 : 0;
+			char age[24];
+			if (secs < 60)
+				snprintf(age, sizeof age, "%llds", secs);
+			else if (secs < 3600)
+				snprintf(age, sizeof age, "%lldm", secs / 60);
+			else if (secs < 86400)
+				snprintf(age, sizeof age, "%lldh", secs / 3600);
+			else
+				snprintf(age, sizeof age, "%lldd", secs / 86400);
+
+			/* hidden: pid, pane. shown: state, age, session, path */
+			printf("%lld\t%s\t%s%-7s\033[0m\t%5s\t%-18s\t%s\n",
+			       a->pid,
+			       a->pane_id[0] ? a->pane_id : "-",
+			       a->parked ? "\033[38;5;244m"
+					 : status_colour_for(a->status),
+			       a->parked ? "parked"
+					 : agent_status_label(a->status),
+			       age,
+			       a->sess[0] ? a->sess : a->name,
+			       a->cwd);
+		}
+		return 0;
+	}
 
 	if (debug) {
 		int n = agents_load(agents, AGENT_MAX);

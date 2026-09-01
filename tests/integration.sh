@@ -104,6 +104,30 @@ sb --rename-session 999999 "must not happen" >/dev/null 2>&1
 $TM list-sessions -F '#{session_name}' | grep -q "must not happen" \
 	&& check 1 "a refused rename changes nothing" || check 0 "a refused rename changes nothing"
 
+# --- picker feed -------------------------------------------------------------
+rows=$(sb --list | wc -l)
+[ "$rows" -ge 3 ] && check 0 "--list emits a row per agent" || check 1 "--list emits a row per agent"
+sb --list | head -1 | awk -F'\t' '{ exit !($1 ~ /^[0-9]+$/ && $2 ~ /^%/) }' \
+	&& check 0 "--list hides pid and pane id in the first two columns" \
+	|| check 1 "--list hides pid and pane id in the first two columns"
+
+# --- kill --------------------------------------------------------------------
+victim=$($TM list-panes -t bravo -F '#{pane_pid}' | head -1)
+sb --kill "$victim" >/dev/null 2>&1
+sleep 2
+kill -0 "$victim" 2>/dev/null \
+	&& check 1 "--kill terminates the agent" || check 0 "--kill terminates the agent"
+
+sb --kill 999999 >/dev/null 2>&1
+[ $? -eq 2 ] && check 0 "--kill refuses an unknown pid" || check 1 "--kill refuses an unknown pid"
+
+sleep 300 & bystander=$!
+sleep 0.3
+sb --kill "$bystander" >/dev/null 2>&1
+kill -0 "$bystander" 2>/dev/null \
+	&& check 0 "--kill will not signal a non-agent" || check 1 "--kill will not signal a non-agent"
+kill "$bystander" 2>/dev/null
+
 # --- overflow ----------------------------------------------------------------
 sb --once --width 26 --rows 4 | grep -q "more" \
 	&& check 0 "a short pane reports hidden rows" || check 1 "a short pane reports hidden rows"

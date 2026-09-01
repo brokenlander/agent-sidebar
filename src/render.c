@@ -79,6 +79,13 @@ static void lb_pad_to(linebuf *lb, int col)
 #define C_DIM "\033[38;5;244m"
 #define C_HEAD "\033[38;5;110m"
 
+static const char *status_colour(agent_status s);
+
+const char *status_colour_for(agent_status s)
+{
+	return status_colour(s);
+}
+
 static const char *status_colour(agent_status s)
 {
 	switch (s) {

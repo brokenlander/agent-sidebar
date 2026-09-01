@@ -91,6 +91,15 @@ AGENT_SIDEBAR_TRACE=/tmp/cs.log ./agent-sidebar   # log input and jump commands
 
 The trace costs one `getenv` per input event and nothing at all when unset.
 
+## The picker
+
+`prefix + g` opens a popup listing every agent, with a live preview of its
+screen. Enter jumps to one, `ctrl-x` kills it, `ctrl-p` parks it.
+
+The sidebar answers "what is happening"; the picker answers "show me that one"
+without giving up a column of screen. Both read the same loader, so opening the
+picker costs about 6ms.
+
 ## Requirements
 
 tmux 3.2 or newer, a C compiler, and libc. Node is needed only to run the
@@ -106,8 +115,9 @@ make
 Then load it from `~/.tmux.conf`:
 
 ```tmux
-set -g @agent_sidebar_key 'e'      # prefix + e toggles the sidebar
+set -g @agent_sidebar_key 'e'         # prefix + e toggles the sidebar
 set -g @agent_sidebar_width '28'
+set -g @agent_sidebar_picker_key 'g'  # prefix + g opens the picker
 run-shell -b '/path/to/agent-sidebar/sidebar.tmux'
 ```
 
@@ -146,6 +156,15 @@ Or run it in any pane directly:
 ./agent-sidebar            # live
 ./agent-sidebar --once     # print one frame and exit
 ```
+
+## Credit
+
+The picker's interaction design - a popup fzf list over the running agents,
+with a `capture-pane` preview and `ctrl-x` to kill - follows
+[craftzdog/tmux-claude-session-manager](https://github.com/craftzdog/tmux-claude-session-manager)
+by Takuya Matsuyama, MIT licensed. The implementation here is independent: rows
+come from the per-pid state files rather than the agent CLI, which is the
+difference between roughly 6ms and 400ms, and it covers opencode as well.
 
 ## What it does not do
 
