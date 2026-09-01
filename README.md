@@ -7,9 +7,9 @@ in, which tmux session it lives in, and how long it has been that way.
  claude                   17
  ○ 1  ● 11  ● 5
 ──────────────────────────────
- ● PR-4 gateway-api       2m
- ● summit kg-summit       4d
- ● csi gateway-api       11m
+ ● api gateway-api        2m
+ ● docs handbook          4d
+ ● web storefront        11m
  ○ price gpu-calculator    4d   <- parked
 ```
 

@@ -181,7 +181,7 @@ static void t_render_widths(void)
 	memset(a, 0, sizeof a);
 	snprintf(a[0].name, sizeof a[0].name, "gateway-api-9f");
 	snprintf(a[0].sess, sizeof a[0].sess, "csi");
-	snprintf(a[0].cwd, sizeof a[0].cwd, "~/forge/gateway-api");
+	snprintf(a[0].cwd, sizeof a[0].cwd, "~/src/gateway-api");
 	a[0].status = ST_BUSY;
 	a[0].seen_ms = 1;
 	snprintf(a[1].sess, sizeof a[1].sess, "a-very-long-session-name-here");
