@@ -23,6 +23,12 @@ done
 
 # Columns: 1 pid, 2 pane id, 3 state, 4 age, 5 session, 6 path.
 # The first two are hidden; they are what the actions key on.
+# A user's FZF_DEFAULT_OPTS is for interactive shell use and does not suit a
+# popup: --height makes fzf occupy a fraction of it and leave the rest blank,
+# and --border draws a second frame inside the popup's own. Start from nothing.
+FZF_DEFAULT_OPTS=''
+export FZF_DEFAULT_OPTS
+
 # fzf's own input is a search box, so a bare "k" would type rather than kill.
 # The actions use alt- mnemonics, with ctrl-x kept as an alias.
 hdr=$(printf '\033[38;5;110menter\033[0m jump   \033[38;5;110malt-k\033[0m kill   \033[38;5;110malt-p\033[0m park   \033[38;5;110malt-v\033[0m preview   \033[38;5;110mesc\033[0m close')
