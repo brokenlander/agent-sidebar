@@ -79,6 +79,7 @@ static void lb_pad_to(linebuf *lb, int col)
 /* Tokyo Night: dim #565f89, accent #7aa2f7 */
 #define C_DIM "\033[38;2;86;95;137m"
 #define C_HEAD "\033[38;2;122;162;247m"
+#define C_SELF "\033[38;2;145;180;250m" /* the agent of this session */
 
 static const char *status_colour(agent_status s);
 
@@ -134,7 +135,7 @@ static void put_line(frame *f, const linebuf *lb, int agent_index)
 }
 
 void render_build(frame *f, const agent *a, int n, int cols, int rows,
-		  long long now_ms)
+		  long long now_ms, const char *self_sess)
 {
 	linebuf lb;
 	int count[ST_UNKNOWN + 1] = { 0 };
@@ -226,10 +227,14 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 			lb_text(&lb, label);
 			lb_raw(&lb, C_RESET);
 		} else {
+			int self = self_sess != NULL && self_sess[0] != '\0' &&
+				   strcmp(g->sess, self_sess) == 0;
 			lb_raw(&lb, status_colour(g->status));
 			lb_text(&lb, " \xe2\x97\x8f ");
-			lb_raw(&lb, C_RESET);
+			lb_raw(&lb, self ? C_SELF : C_RESET);
 			lb_text(&lb, label);
+			if (self)
+				lb_raw(&lb, C_RESET);
 		}
 
 		/* room for the cwd basename only on a wide enough pane */

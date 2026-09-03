@@ -1,6 +1,8 @@
 #ifndef CS_AGENTS_H
 #define CS_AGENTS_H
 
+#include <stddef.h>
+
 #define AGENT_MAX 256
 
 typedef enum {
@@ -39,5 +41,9 @@ int agents_park_has(const char *sess);
 
 /* Drop the cached pane map so the next load re-reads it from tmux. */
 void agents_invalidate(void);
+
+/* Session name of the pane the sidebar runs in, from the cached pane map.
+   Empty when unknown. Returns 1 when found. */
+int agents_self_session(char *dst, size_t cap);
 
 #endif

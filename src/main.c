@@ -828,7 +828,7 @@ int main(int argc, char **argv)
 		}
 		render_build(&cur, agents, n, cols,
 			     force_rows > 0 ? force_rows : FRAME_ROWS,
-			     now_ms());
+			     now_ms(), self);
 		for (int i = 0; i < cur.rows; i++)
 			printf("%s\033[0m\n", cur.line[i]);
 		return 0;
@@ -889,7 +889,9 @@ int main(int argc, char **argv)
 		int n = agents_load(agents, AGENT_MAX);
 		if (n < 0)
 			n = 0;
-		render_build(&cur, agents, n, cols, rows, now_ms());
+		char self[64];
+		agents_self_session(self, sizeof self);
+		render_build(&cur, agents, n, cols, rows, now_ms(), self);
 		render_flush(STDOUT_FILENO, &cur, &prev, force);
 		force = 0;
 
@@ -929,3 +931,5 @@ int main(int argc, char **argv)
 	tty_restore();
 	return 0;
 }
+		char self[64];
+		agents_self_session(self, sizeof self);

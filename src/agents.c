@@ -257,6 +257,7 @@ static int tty_map_load(struct ttyrow *rows, int cap)
 
 static int map_nrows;
 static time_t map_fetched;
+static struct ttyrow map_rows[TTYMAP_MAX];
 
 void agents_invalidate(void)
 {
@@ -265,7 +266,7 @@ void agents_invalidate(void)
 
 static void resolve_panes(agent *a, int n)
 {
-	static struct ttyrow rows[TTYMAP_MAX];
+	struct ttyrow *rows = map_rows;
 	int nrows = map_nrows;
 	time_t fetched = map_fetched;
 
@@ -316,6 +317,24 @@ static void resolve_panes(agent *a, int n)
 		map_nrows = nrows;
 		map_fetched = fetched;
 	}
+}
+
+/* The session this sidebar runs in, read from the same cached pane map so
+   it follows a rename like every other row. */
+int agents_self_session(char *dst, size_t cap)
+{
+	const char *pane = getenv("TMUX_PANE");
+
+	dst[0] = '\0';
+	if (pane == NULL || *pane == '\0')
+		return 0;
+	for (int r = 0; r < map_nrows; r++) {
+		if (strcmp(map_rows[r].pane_id, pane) == 0) {
+			snprintf(dst, cap, "%s", map_rows[r].sess);
+			return 1;
+		}
+	}
+	return 0;
 }
 
 static agent_status parse_status(const char *s)

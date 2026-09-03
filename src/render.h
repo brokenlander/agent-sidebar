@@ -15,8 +15,9 @@ typedef struct {
 /* The colour a status is drawn in, so other output can match the sidebar. */
 const char *status_colour_for(agent_status s);
 
+/* self_sess: the session the sidebar runs in; its agent is drawn as current. */
 void render_build(frame *f, const agent *a, int n, int cols, int rows,
-		  long long now_ms);
+		  long long now_ms, const char *self_sess);
 
 /* Emits only the lines that differ from prev, then copies cur into prev.
    force repaints everything (use after SIGWINCH). Returns bytes written. */
