@@ -76,8 +76,9 @@ static void lb_pad_to(linebuf *lb, int col)
 }
 
 #define C_RESET "\033[0m"
-#define C_DIM "\033[38;5;244m"
-#define C_HEAD "\033[38;5;110m"
+/* Tokyo Night: dim #565f89, accent #7aa2f7 */
+#define C_DIM "\033[38;2;86;95;137m"
+#define C_HEAD "\033[38;2;122;162;247m"
 
 static const char *status_colour(agent_status s);
 
@@ -89,10 +90,10 @@ const char *status_colour_for(agent_status s)
 static const char *status_colour(agent_status s)
 {
 	switch (s) {
-	case ST_WAITING: return "\033[38;5;214m"; /* amber - needs you */
-	case ST_IDLE:    return "\033[38;5;114m"; /* green - your turn */
-	case ST_BUSY:    return "\033[38;5;204m"; /* red   - working */
-	default:         return "\033[38;5;244m";
+	case ST_WAITING: return "\033[38;2;224;175;104m"; /* amber - needs you */
+	case ST_IDLE:    return "\033[38;2;158;206;106m"; /* green - your turn */
+	case ST_BUSY:    return "\033[38;2;247;118;142m"; /* red   - working */
+	default:         return C_DIM;
 	}
 }
 
@@ -278,6 +279,14 @@ long render_flush(int fd, const frame *cur, frame *prev, int force)
 	int high = cur->rows > prev->rows ? cur->rows : prev->rows;
 	if (high > FRAME_ROWS)
 		high = FRAME_ROWS;
+
+	/* A forced repaint follows a resize, and the frame's rows are all it
+	   knows about. Clear the screen and its history so nothing tmux moved
+	   or wrapped outside those rows survives. */
+	if (force) {
+		memcpy(out, "\033[2J\033[3J", 8);
+		o = 8;
+	}
 
 	for (int i = 0; i < high; i++) {
 		const char *want = i < cur->rows ? cur->line[i] : "";
