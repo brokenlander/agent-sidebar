@@ -79,7 +79,8 @@ static void lb_pad_to(linebuf *lb, int col)
 /* Tokyo Night: dim #565f89, accent #7aa2f7 */
 #define C_DIM "\033[38;2;86;95;137m"
 #define C_HEAD "\033[38;2;122;162;247m"
-#define C_SELF "\033[38;2;145;180;250m" /* the agent of this session */
+#define C_NAME "\033[38;2;145;180;250m" /* running agents */
+#define C_BOLD "\033[1m"                /* the agent of this session */
 
 static const char *status_colour(agent_status s);
 
@@ -231,10 +232,9 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 				   strcmp(g->sess, self_sess) == 0;
 			lb_raw(&lb, status_colour(g->status));
 			lb_text(&lb, " \xe2\x97\x8f ");
-			lb_raw(&lb, self ? C_SELF : C_RESET);
+			lb_raw(&lb, self ? C_RESET C_NAME C_BOLD : C_RESET C_NAME);
 			lb_text(&lb, label);
-			if (self)
-				lb_raw(&lb, C_RESET);
+			lb_raw(&lb, C_RESET);
 		}
 
 		/* room for the cwd basename only on a wide enough pane */
