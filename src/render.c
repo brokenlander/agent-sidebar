@@ -80,7 +80,7 @@ static void lb_pad_to(linebuf *lb, int col)
 #define C_DIM "\033[38;2;86;95;137m"
 #define C_HEAD "\033[38;2;122;162;247m"
 #define C_NAME "\033[38;2;145;180;250m" /* running agents */
-#define C_SELF "\033[38;2;213;220;255m" /* the agent of this session: a lighter lavender */
+#define C_SELF "\033[38;2;240;244;255m" /* the agent of this session: near white */
 
 static const char *status_colour(agent_status s);
 
