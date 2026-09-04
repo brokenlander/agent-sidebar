@@ -21,7 +21,21 @@ sidebar_in() {
 		awk '$2 == "agent-sidebar" { print $1; exit }'
 }
 
+# A window whose session matches @agent_sidebar_exclude (a case glob, e.g.
+# "scratch" or "scratch|popup*") never gets a sidebar: a scratch popup or other
+# utility session wants a bare terminal, not the panel.
+excluded() {
+	pat="$(tmux show-option -gqv @agent_sidebar_exclude)"
+	[ -z "$pat" ] && return 1
+	sess="$(tmux display-message -p -t "$1" '#{session_name}' 2>/dev/null)"
+	case "$sess" in
+	$pat) return 0 ;;
+	*)    return 1 ;;
+	esac
+}
+
 open_in() {
+	excluded "$1" && return 0
 	[ -n "$(sidebar_in "$1")" ] && return 0
 	# -b puts it on the left, -d keeps focus where it was
 	tmux split-window -h -b -l "$width" -d -t "$1" "$BIN"

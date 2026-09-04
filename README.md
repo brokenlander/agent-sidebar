@@ -32,6 +32,10 @@ installs at index 1 of that hook, so one you set yourself at index 0 is left
 alone. A window holding nothing but a sidebar is never closed, since that
 would close the window and its session with it.
 
+Set `@agent_sidebar_exclude` to a session-name pattern (a shell `case` glob,
+e.g. `scratch` or `scratch|popup*`) to keep those sessions sidebar-free - a
+scratch popup wants a bare terminal, not the panel.
+
 ## Clicking
 
 - **Left-click a row** to jump to that agent: the client looking at the sidebar
