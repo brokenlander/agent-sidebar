@@ -23,6 +23,10 @@ test: tests/test_json.c $(SRC)
 	@command -v node >/dev/null && node tests/test_opencode_plugin.mjs || \
 		echo "  SKIP  opencode producer tests (node not found)"
 	@bash tests/integration.sh
+	@command -v python3 >/dev/null && python3 tests/test_picker.py || \
+		echo "  SKIP  picker tests (python3 not found)"
+	@command -v python3 >/dev/null && python3 tests/test_menu.py || \
+		echo "  SKIP  menu tests (python3 not found)"
 
 sanitize: $(SRC) $(MAIN)
 	$(CC) -std=c17 -g -O1 -Wall -Wextra -fsanitize=address,undefined \

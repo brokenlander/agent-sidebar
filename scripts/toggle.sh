@@ -1,26 +1,25 @@
 #!/usr/bin/env sh
-# Toggle the sidebar in one window. Idempotent: a second press closes it, so
-# a window can never end up with two.
+# One control for every session. Pressed in a window without a sidebar, it
+# opens one in every window of every session; pressed in a window with one, it
+# closes them all. The choice is kept in @agent_sidebar_open so a window or
+# session created afterwards starts the same way, through ensure.sh.
 set -u
-DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$DIR/agent-sidebar"
+. "$(dirname "$0")/common.sh"
 win="${1:-}"
-
-width="$(tmux show-option -gqv @agent_sidebar_width)"
-[ -z "$width" ] && width=28
-
-existing="$(tmux list-panes -t "$win" -F '#{pane_id} #{pane_current_command}' 2>/dev/null |
-	awk '$2 == "agent-sidebar" { print $1; exit }')"
-
-if [ -n "$existing" ]; then
-	tmux kill-pane -t "$existing"
-	exit 0
-fi
 
 if [ ! -x "$BIN" ]; then
 	tmux display-message "agent-sidebar: not built - run 'make' in $DIR"
 	exit 0
 fi
 
-# -b puts it on the left, -d keeps focus where it was
-tmux split-window -h -b -l "$width" -d -t "$win" "$BIN"
+if [ -n "$(sidebar_in "$win")" ]; then
+	tmux set-option -g @agent_sidebar_open 0
+	for w in $(tmux list-windows -a -F '#{window_id}'); do
+		close_in "$w"
+	done
+else
+	tmux set-option -g @agent_sidebar_open 1
+	for w in $(tmux list-windows -a -F '#{window_id}'); do
+		open_in "$w"
+	done
+fi

@@ -160,11 +160,85 @@ $TM list-sessions -F '#{session_name}' | grep -qx "fresh-2" \
 sb --new "$TMP/not-a-dir" >/dev/null 2>&1
 [ $? -eq 2 ] && check 0 "--new refuses a non-directory" || check 1 "--new refuses a non-directory"
 
+# --- width -------------------------------------------------------------------
+# tmux hands a sidebar half of any change in window width; it must put itself
+# back, unless the border itself was dragged. tmux passes a pane's new size to
+# the application at most once a second, so each step is waited for, not slept
+# through: a fixed sleep landed on that boundary and lost the drag.
+width_is() { # <cols>
+	for _ in {1..20}; do
+		[ "$($TM display-message -p -t "$PANE" '#{pane_width}')" = "$1" ] && return 0
+		sleep 0.25
+	done
+	return 1
+}
+traced() { # <text>
+	for _ in {1..20}; do
+		grep -q "$1" "$TMP/trace" 2>/dev/null && return 0
+		sleep 0.25
+	done
+	return 1
+}
+rows0=$(view | grep -c .)
+$TM resize-window -t bar -x 180
+width_is 30 && check 0 "holds its width when the window grows" \
+	|| check 1 "holds its width when the window grows"
+$TM resize-pane -t "$PANE" -x 40                    # a drag of the border
+traced "dragged 30 -> 40" && check 0 "a border drag is not undone" \
+	|| check 1 "a border drag is not undone"
+$TM resize-window -t bar -x 120
+width_is 40 && check 0 "a dragged width is the one held" \
+	|| check 1 "a dragged width is the one held"
+
+# --- fresh -------------------------------------------------------------------
+# tmux reflows a pane's text when its width changes, and once left a wrapped
+# tail of the old frame below the new one. The sidebar runs on the alternate
+# screen, which tmux never reflows, and a repaint after a resize clears first.
+sleep 2
+[ "$(view | grep -c .)" = "$rows0" ] && check 0 "a resize leaves no stale rows behind" \
+	|| check 1 "a resize leaves no stale rows behind"
+
 # --- overflow ----------------------------------------------------------------
 sb --once --width 26 --rows 4 | grep -q "more" \
 	&& check 0 "a short pane reports hidden rows" || check 1 "a short pane reports hidden rows"
 sb --once --width 26 --rows 40 | grep -q "more" \
 	&& check 1 "a tall pane reports nothing hidden" || check 0 "a tall pane reports nothing hidden"
+
+# --- one control -------------------------------------------------------------
+# prefix+e is one control for every session: open everywhere, close everywhere,
+# and a window made later comes up the same way through the window-linked hook
+# that sidebar.tmux installs. Last, because it touches every window.
+ROOT="$(dirname "$BIN")"
+tm_env() { TMUX="$SOCKPATH,0,0" "$@"; }
+tm_env bash "$ROOT/sidebar.tmux"
+windows()      { $TM list-windows -a -F '#{window_id}' | wc -l; }
+with_sidebar() { $TM list-panes -a -F '#{window_id} #{pane_current_command}' | awk '$2=="agent-sidebar"{print $1}' | sort -u | wc -l; }
+$TM new-session -d -s lone -x 120 -y 30 "$BIN"     # a window with nothing but a sidebar
+sleep 1
+host_win=$($TM display-message -p -t host '#{window_id}')
+tm_env "$ROOT/scripts/toggle.sh" "$host_win"; sleep 2
+[ "$(with_sidebar)" = "$(windows)" ] \
+	&& check 0 "toggling in a bare window opens one in every window" \
+	|| check 1 "toggling in a bare window opens one in every window"
+[ "$($TM list-panes -t lone | wc -l)" = 1 ] \
+	&& check 0 "a window that already has one is left alone" \
+	|| check 1 "a window that already has one is left alone"
+$TM new-session -d -s later -x 120 -y 30 "sleep 600"; sleep 2
+$TM list-panes -t later -F '#{pane_current_command}' | grep -qx agent-sidebar \
+	&& check 0 "a session created later gets one" \
+	|| check 1 "a session created later gets one"
+bar_win=$($TM display-message -p -t bar '#{window_id}')
+tm_env "$ROOT/scripts/toggle.sh" "$bar_win"; sleep 2
+[ "$(with_sidebar)" = 1 ] \
+	&& check 0 "toggling in a window with one closes them all" \
+	|| check 1 "toggling in a window with one closes them all"
+$TM has-session -t lone 2>/dev/null \
+	&& check 0 "a window with nothing but a sidebar is not closed" \
+	|| check 1 "a window with nothing but a sidebar is not closed"
+$TM new-session -d -s after -x 120 -y 30 "sleep 600"; sleep 2
+$TM list-panes -t after -F '#{pane_current_command}' | grep -qx agent-sidebar \
+	&& check 1 "a session created after a close stays bare" \
+	|| check 0 "a session created after a close stays bare"
 
 echo
 [ "$fails" -eq 0 ] && { echo "  OK    all integration checks passed"; exit 0; }

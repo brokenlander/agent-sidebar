@@ -22,15 +22,34 @@ Amber needs you, green is idle and yours, red is working. An agent that has
 backgrounded a shell command still counts as idle - it is not a state you act
 on differently. Sorted so whatever needs you is at the top.
 
+## One control
+
+`prefix + e` is one switch for every session. Pressed in a window without a
+sidebar it opens one in every window of every session; pressed in a window
+with one it closes them all. A window or session created while they are open
+gets one as it appears, through a `window-linked` hook that `sidebar.tmux`
+installs at index 1 of that hook, so one you set yourself at index 0 is left
+alone. A window holding nothing but a sidebar is never closed, since that
+would close the window and its session with it.
+
 ## Clicking
 
 - **Left-click a row** to jump to that agent: the client looking at the sidebar
   switches session, window and pane in one go.
-- **Middle-click a row** for a menu: jump, park/un-park, or rename the tmux
-  session. tmux renders the menu itself via `display-menu`, so there is no menu
-  widget here - just a command string. Rename pre-fills the current name and
-  moves the park entry with it, so a parked agent does not un-park because its
-  key changed.
+- **Middle-click a row** for a menu: jump, park/un-park, rename the tmux
+  session, start another agent, or kill one. tmux renders the menu itself via
+  `display-menu`, so there is no menu widget here - just a command string.
+  Choose an item with the mouse or its bracketed key. Rename pre-fills the
+  current name and moves the park entry with it, so a parked agent does not
+  un-park because its key changed.
+
+  The menu is passed `-M -O`. A menu opened by a program rather than by a tmux
+  mouse binding is marked "no mouse", and the release of the very button that
+  opened it would then close it again - the menu appeared to flash and vanish
+  as you let go. `-M` (tmux 3.5+) lets the menu take the click, and `-O` keeps
+  it up when a click lands off an item. On tmux older than 3.5, `-M` does not
+  exist, so the menu is keyboard-only and still closes on the release; its keys
+  work, but a mouse choice needs 3.5 or newer.
 - **Right-click a row** to park it directly, without the menu. Parked agents
   sink below everything else, whatever they are doing, and render as a hollow
   dimmed dot. Click again to bring one back.
@@ -51,6 +70,21 @@ bind -n MouseDown3Pane if -F "#{||:#{pane_in_mode},#{mouse_any_flag}}" \
 
 Middle-click works either way, since tmux's default `MouseDown2Pane` binding
 already forwards on that condition.
+
+## Width
+
+The sidebar opens at `@agent_sidebar_width` columns (default 28) and holds
+that width. tmux shares a change in window width equally between side-by-side
+panes, so a window last sized by a narrower terminal hands the sidebar half of
+the difference when a wider one looks at it: 28 columns came back as 61, and
+from 40 the rows gain a directory column. When the window's width changes the
+sidebar puts itself back. A resize with the window unchanged is you dragging
+the border, and that width is the one held from then on.
+
+The pane runs on the alternate screen, which tmux never reflows, and a repaint
+after a resize clears the pane first. Before that, narrowing a pane wrapped
+every row and the wrapped tails sat below the new frame as a stale copy of it,
+which is what an old session's sidebar looked like until it was reopened.
 
 ## Why it is cheap
 
@@ -134,7 +168,7 @@ make
 Then load it from `~/.tmux.conf`:
 
 ```tmux
-set -g @agent_sidebar_key 'e'         # prefix + e toggles the sidebar
+set -g @agent_sidebar_key 'e'         # prefix + e toggles the sidebar everywhere
 set -g @agent_sidebar_width '28'
 set -g @agent_sidebar_picker_key 'g'  # prefix + g opens the picker
 run-shell -b '/path/to/agent-sidebar/sidebar.tmux'

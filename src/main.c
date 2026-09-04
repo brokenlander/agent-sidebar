@@ -98,7 +98,7 @@ static void emit(const char *s)
    left in raw mode with mouse reporting on. */
 static void tty_restore(void)
 {
-	emit("\033[?1006l\033[?1000l\033[?25h");
+	emit("\033[?1006l\033[?1000l\033[?25h\033[?1049l");
 	if (g_tio_saved)
 		tcsetattr(STDIN_FILENO, TCSANOW, &g_saved_tio);
 }
@@ -206,6 +206,73 @@ static void notify(const char *msg)
 	run_tmux(argv);
 }
 
+/* Hold the sidebar's width across window resizes.
+ *
+ * tmux shares a change in window width equally between side-by-side panes. A
+ * window last sized by a narrower client is resized when a wider one looks at
+ * it, and the sidebar takes half of the difference: 28 columns opened in a
+ * 184-column window come back as 61 in a 250-column one, past the point where
+ * the rows gain a directory column. Only a change in the window's width is
+ * undone. The window unchanged means the border was dragged, and the dragged
+ * width is the one held from then on.
+ */
+static int held_cols;     /* 0 until the pane is known to be in tmux */
+static int held_win_cols;
+
+static int window_width(void)
+{
+	const char *pane = getenv("TMUX_PANE");
+	char out[32];
+
+	if (pane == NULL || *pane == '\0')
+		return -1;
+	char *argv[] = { (char *)"tmux", (char *)"display-message",
+			 (char *)"-p", (char *)"-t", (char *)pane,
+			 (char *)"#{window_width}", NULL };
+	if (capture_all(argv, out, sizeof out) != 0)
+		return -1;
+	int w = atoi(out);
+	return w > 0 ? w : -1;
+}
+
+static void hold_width_init(int cols)
+{
+	int w = window_width();
+
+	if (w < 0)
+		return;
+	held_cols = cols;
+	held_win_cols = w;
+}
+
+static void hold_width(int cols)
+{
+	if (held_cols <= 0)
+		return;
+	int w = window_width();
+	if (w < 0)
+		return;
+	if (w == held_win_cols) {
+		/* a border drag: keep what was chosen */
+		if (cols != held_cols)
+			trace("hold width: dragged %d -> %d", held_cols, cols);
+		held_cols = cols;
+		return;
+	}
+	held_win_cols = w;
+	if (cols == held_cols)
+		return;
+
+	char want[16];
+	snprintf(want, sizeof want, "%d", held_cols);
+	char *argv[] = { (char *)"tmux", (char *)"resize-pane",
+			 (char *)"-t", (char *)getenv("TMUX_PANE"),
+			 (char *)"-x", want, NULL };
+	int rc = run_tmux(argv);
+	trace("hold width: window %d, pane %d -> %d, rc=%d", w, cols,
+	      held_cols, rc);
+}
+
 
 /* Move the client that is looking at this sidebar to the clicked agent. The
    client is resolved from our own session rather than left to tmux's notion of
@@ -277,6 +344,28 @@ static void jump_to(const agent *a)
 	      client, rc);
 }
 
+/* -M (let the menu handle mouse clicks) landed in tmux 3.5; before that the
+   flag is rejected and the menu will not open at all, so it is gated on the
+   server's own version. Cached: a server cannot change version under a running
+   pane without restarting, which restarts this too. */
+static int menu_mouse_ok(void)
+{
+	static int cached = -1;
+	char out[32];
+
+	if (cached != -1)
+		return cached;
+	cached = 0;
+	char *argv[] = { (char *)"tmux", (char *)"display-message",
+			 (char *)"-p", (char *)"#{version}", NULL };
+	if (capture_all(argv, out, sizeof out) == 0) {
+		int maj = 0, min = 0;
+		if (sscanf(out, "%d.%d", &maj, &min) == 2)
+			cached = maj > 3 || (maj == 3 && min >= 5);
+	}
+	return cached;
+}
+
 /* tmux renders the menu, handles its keys and runs the chosen command, so the
    sidebar needs no menu widget of its own. */
 static void open_menu(const agent *a)
@@ -318,18 +407,43 @@ static void open_menu(const agent *a)
 		 "{ run-shell '%s --rename-session %s \"%%%%\"' }",
 		 a->sess, self, pid);
 
-	char *argv[] = {
-		(char *)"tmux", (char *)"display-menu",
-		(char *)"-T", title, (char *)"-x", (char *)"P",
-		(char *)"-y", (char *)"P",
-		(char *)"Jump to", (char *)"j", jump,
-		(char *)(a->parked ? "Un-park" : "Park"), (char *)"p", park,
-		(char *)"", (char *)"", (char *)"",
-		(char *)"Rename", (char *)"r", rename,
-		(char *)"New agent", (char *)"n", newc,
-		(char *)"Kill", (char *)"k", killc,
-		NULL,
-	};
+	/* -O keeps the menu up when a click lands off an item instead of closing
+	   it, and -M lets a click choose one. A process-opened menu is marked
+	   "no mouse" by tmux, so without these the button release that opened it
+	   would close it again - see the release-triggered path in
+	   act_on_click. -M needs tmux 3.5. */
+	char *argv[32];
+	int k = 0;
+	argv[k++] = (char *)"tmux";
+	argv[k++] = (char *)"display-menu";
+	argv[k++] = (char *)"-O";
+	if (menu_mouse_ok())
+		argv[k++] = (char *)"-M";
+	argv[k++] = (char *)"-T";
+	argv[k++] = title;
+	argv[k++] = (char *)"-x";
+	argv[k++] = (char *)"P";
+	argv[k++] = (char *)"-y";
+	argv[k++] = (char *)"P";
+	argv[k++] = (char *)"Jump to";
+	argv[k++] = (char *)"j";
+	argv[k++] = jump;
+	argv[k++] = (char *)(a->parked ? "Un-park" : "Park");
+	argv[k++] = (char *)"p";
+	argv[k++] = park;
+	argv[k++] = (char *)"";
+	argv[k++] = (char *)"";
+	argv[k++] = (char *)"";
+	argv[k++] = (char *)"Rename";
+	argv[k++] = (char *)"r";
+	argv[k++] = rename;
+	argv[k++] = (char *)"New agent";
+	argv[k++] = (char *)"n";
+	argv[k++] = newc;
+	argv[k++] = (char *)"Kill";
+	argv[k++] = (char *)"k";
+	argv[k++] = killc;
+	argv[k++] = NULL;
 
 	trace("menu for sess=%s pid=%s", a->sess, pid);
 
@@ -826,6 +940,8 @@ int main(int argc, char **argv)
 			      "directory\n", stderr);
 			return 1;
 		}
+		char self[64];
+		agents_self_session(self, sizeof self);
 		render_build(&cur, agents, n, cols,
 			     force_rows > 0 ? force_rows : FRAME_ROWS,
 			     now_ms(), self);
@@ -870,9 +986,13 @@ int main(int argc, char **argv)
 	trace("start: stdin isatty=%d TMUX_PANE=%s", isatty(STDIN_FILENO),
 	      getenv("TMUX_PANE") ? getenv("TMUX_PANE") : "(unset)");
 	atexit(tty_restore);
-	emit("\033[?25l\033[2J");
+	/* The alternate screen is never reflowed by tmux. On the normal screen a
+	   narrower pane wraps every row, and the wrapped tails stayed below the
+	   repainted frame as a stale copy of it. */
+	emit("\033[?1049h\033[?25l\033[2J");
 	if (isatty(STDIN_FILENO))
 		tty_setup();
+	hold_width_init(cols);
 
 	prev.rows = 0;
 	int force = 1;
@@ -881,6 +1001,7 @@ int main(int argc, char **argv)
 		if (g_winch) {
 			g_winch = 0;
 			term_size(STDOUT_FILENO, &cols, &rows);
+			hold_width(cols);
 			force = 1;
 		}
 
@@ -931,5 +1052,3 @@ int main(int argc, char **argv)
 	tty_restore();
 	return 0;
 }
-		char self[64];
-		agents_self_session(self, sizeof self);

@@ -60,7 +60,12 @@ kind=$(printf '%s' "$row" | cut -f7)
 if [ "$key" = "alt-n" ]; then
 	# Prompt rather than firing: starting an agent costs real money, and
 	# the target directory comes from wherever the cursor happened to be.
-	tmux command-prompt -p "new $kind agent in:" -I "$dir" \
+	#
+	# -b matters. Without it command-prompt does not return until the prompt
+	# is answered, so this script never exits, the popup never closes, and
+	# the open popup takes every key the answer would need: a blank popup
+	# that nothing gets out of.
+	tmux command-prompt -b -p "new $kind agent in:" -I "$dir" \
 		"run-shell \"$BIN --new '%%' $kind\""
 	exit 0
 fi
