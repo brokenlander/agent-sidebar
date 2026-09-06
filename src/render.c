@@ -132,18 +132,95 @@ static void put_line(frame *f, const linebuf *lb, int agent_index)
 		return;
 	memcpy(f->line[f->rows], lb->buf, lb->len + 1);
 	f->row_agent[f->rows] = agent_index;
+	f->row_session[f->rows][0] = '\0';
 	f->rows++;
 }
 
+/* A dim horizontal rule between sections. */
+static void section_rule(frame *f, int cols)
+{
+	linebuf lb;
+	lb_init(&lb, cols);
+	lb_raw(&lb, C_DIM);
+	for (int i = 0; i < cols; i++)
+		lb_text(&lb, "\xe2\x94\x80"); /* \u2500 */
+	lb_raw(&lb, C_RESET);
+	put_line(f, &lb, -1);
+}
+
+/* A dim section sub-heading. */
+static void section_head(frame *f, int cols, const char *label)
+{
+	linebuf lb;
+	lb_init(&lb, cols);
+	lb_raw(&lb, C_DIM);
+	lb_text(&lb, label);
+	lb_raw(&lb, C_RESET);
+	put_line(f, &lb, -1);
+}
+
+/* "key label|key label|..." as one or two columns of dim rows, key accented. */
+static void render_legend(frame *f, int cols, const char *legend)
+{
+	int per_line = cols >= 24 ? 2 : 1;
+	int colw = cols / per_line;
+	linebuf lb;
+	int in_line = 0;
+
+	for (const char *p = legend; *p != '\0';) {
+		const char *bar = strchr(p, '|');
+		size_t len = bar != NULL ? (size_t)(bar - p) : strlen(p);
+		char entry[64];
+		if (len >= sizeof entry)
+			len = sizeof entry - 1;
+		memcpy(entry, p, len);
+		entry[len] = '\0';
+
+		if (in_line == 0)
+			lb_init(&lb, cols);
+		else
+			lb_pad_to(&lb, colw * in_line);
+
+		lb_text(&lb, " ");
+		char *sp = strchr(entry, ' ');
+		if (sp != NULL) {
+			*sp = '\0';
+			lb_raw(&lb, C_NAME);
+			lb_text(&lb, entry);
+			lb_raw(&lb, C_RESET C_DIM);
+			lb_text(&lb, " ");
+			lb_text(&lb, sp + 1);
+			lb_raw(&lb, C_RESET);
+		} else {
+			lb_raw(&lb, C_DIM);
+			lb_text(&lb, entry);
+			lb_raw(&lb, C_RESET);
+		}
+
+		if (++in_line >= per_line) {
+			put_line(f, &lb, -1);
+			in_line = 0;
+		}
+		if (bar == NULL)
+			break;
+		p = bar + 1;
+	}
+	if (in_line > 0)
+		put_line(f, &lb, -1);
+}
+
 void render_build(frame *f, const agent *a, int n, int cols, int rows,
-		  long long now_ms, const char *self_sess)
+		  long long now_ms, const char *self_sess,
+		  char (*sessions)[64], int nsessions, const char *legend)
 {
 	linebuf lb;
 	int count[ST_UNKNOWN + 1] = { 0 };
 
 	f->rows = 0;
-	for (int i = 0; i < FRAME_ROWS; i++)
+	for (int i = 0; i < FRAME_ROWS; i++) {
 		f->row_agent[i] = -1;
+		f->row_session[i][0] = '\0';
+	}
 	if (cols < 12)
 		cols = 12;
 
@@ -191,18 +268,49 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 	}
 	put_line(f, &lb, -1);
 
-	lb_init(&lb, cols);
-	lb_raw(&lb, C_DIM);
-	for (int i = 0; i < cols; i++)
-		lb_text(&lb, "\xe2\x94\x80"); /* ─ */
-	lb_raw(&lb, C_RESET);
-	put_line(f, &lb, -1);
+	section_rule(f, cols);
+
+	/* Reserve the bottom sections so a long agent list never pushes them
+	   off: agents fill the top and overflow with a "+N more" line, then the
+	   other-sessions and key-legend sections follow. */
+	int legend_lines = 0;
+	if (legend != NULL && legend[0] != '\0') {
+		int per_line = cols >= 24 ? 2 : 1;
+		int entries = 1;
+		for (const char *p = legend; *p != '\0'; p++)
+			if (*p == '|')
+				entries++;
+		legend_lines = (entries + per_line - 1) / per_line;
+	}
+
+	int avail = rows - f->rows;
+	if (avail < 1)
+		avail = 1;
+
+	int legend_h = legend_lines > 0 ? 2 + legend_lines : 0;
+	if (legend_h > avail - 1) { /* no room: drop the legend */
+		legend_h = 0;
+		legend_lines = 0;
+	}
+
+	int sess_shown = nsessions;
+	int sess_h = nsessions > 0 ? 2 + nsessions : 0;
+	if (sess_h > avail - legend_h - 1) { /* trim sessions to fit */
+		int budget = avail - legend_h - 1; /* leave >= 1 row for agents */
+		if (budget >= 3) {
+			sess_shown = budget - 3; /* rule + head + "+N more" */
+			sess_h = 2 + sess_shown + 1;
+		} else {
+			sess_shown = 0;
+			sess_h = 0;
+		}
+	}
 
 	/* One row per agent. When they do not fit, the last line says how many
 	   are hidden: silently dropping them would look like they had been
 	   deleted, and the ones that vanish are the bottom of the sort, which
 	   is exactly where parked agents live. */
-	int room = rows - f->rows;
+	int room = avail - legend_h - sess_h;
 	int shown = n;
 	if (room < 1)
 		room = 1;
@@ -272,6 +380,39 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 		lb_text(&lb, " no agents");
 		lb_raw(&lb, C_RESET);
 		put_line(f, &lb, -1);
+	}
+
+	/* Other tmux sessions - the ones with no agent. Clickable to jump. */
+	if (sess_shown > 0) {
+		section_rule(f, cols);
+		section_head(f, cols, " sessions");
+		for (int i = 0; i < sess_shown; i++) {
+			lb_init(&lb, cols);
+			lb_raw(&lb, C_DIM);
+			lb_text(&lb, " \xc2\xb7 "); /* · */
+			lb_raw(&lb, C_RESET C_NAME);
+			lb_text(&lb, sessions[i]);
+			lb_raw(&lb, C_RESET);
+			put_line(f, &lb, -1);
+			snprintf(f->row_session[f->rows - 1],
+				 sizeof f->row_session[0], "%s", sessions[i]);
+		}
+		if (sess_shown < nsessions) {
+			char t[32];
+			snprintf(t, sizeof t, " +%d more", nsessions - sess_shown);
+			lb_init(&lb, cols);
+			lb_raw(&lb, C_DIM);
+			lb_text(&lb, t);
+			lb_raw(&lb, C_RESET);
+			put_line(f, &lb, -1);
+		}
+	}
+
+	/* Key legend. */
+	if (legend_lines > 0) {
+		section_rule(f, cols);
+		section_head(f, cols, " keys");
+		render_legend(f, cols, legend);
 	}
 }
 

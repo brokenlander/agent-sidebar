@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <fnmatch.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -335,6 +336,57 @@ int agents_self_session(char *dst, size_t cap)
 		}
 	}
 	return 0;
+}
+
+/* A session name matched by the exclude pattern - a shell-style glob list, the
+   alternatives separated by '|', as @agent_sidebar_exclude takes. */
+static int name_excluded(const char *sess, const char *pat)
+{
+	if (pat == NULL || pat[0] == '\0')
+		return 0;
+	char buf[256];
+	snprintf(buf, sizeof buf, "%s", pat);
+	char *save = NULL;
+	for (char *p = strtok_r(buf, "|", &save); p != NULL;
+	     p = strtok_r(NULL, "|", &save))
+		if (fnmatch(p, sess, 0) == 0)
+			return 1;
+	return 0;
+}
+
+int agents_sessions(char out[][64], int cap, const agent *a, int n,
+		    const char *exclude)
+{
+	int m = 0;
+
+	for (int r = 0; r < map_nrows && m < cap; r++) {
+		const char *sess = map_rows[r].sess;
+		if (sess[0] == '\0' || name_excluded(sess, exclude))
+			continue;
+
+		int skip = 0;
+		for (int i = 0; i < n; i++)      /* a session holding an agent */
+			if (strcmp(a[i].sess, sess) == 0) { skip = 1; break; }
+		for (int k = 0; !skip && k < m; k++) /* already listed */
+			if (strcmp(out[k], sess) == 0) { skip = 1; break; }
+		if (skip)
+			continue;
+
+		snprintf(out[m], 64, "%s", sess);
+		m++;
+	}
+
+	for (int i = 1; i < m; i++) {         /* stable order: sort by name */
+		char tmp[64];
+		memcpy(tmp, out[i], 64);
+		int j = i - 1;
+		while (j >= 0 && strcmp(out[j], tmp) > 0) {
+			memcpy(out[j + 1], out[j], 64);
+			j--;
+		}
+		memcpy(out[j + 1], tmp, 64);
+	}
+	return m;
 }
 
 static agent_status parse_status(const char *s)

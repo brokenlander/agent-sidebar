@@ -191,12 +191,12 @@ static void t_render_widths(void)
 	/* narrow, normal, wide, and absurd - none may overflow a line */
 	int widths[] = { 1, 8, 20, 42, 200, 4000 };
 	for (size_t i = 0; i < sizeof widths / sizeof widths[0]; i++) {
-		render_build(&f, a, 3, widths[i], 50, 1000000, NULL);
+		render_build(&f, a, 3, widths[i], 50, 1000000, NULL, NULL, 0, NULL);
 		for (int r = 0; r < f.rows; r++)
 			check(strlen(f.line[r]) < LINE_MAX,
 			      "rendered line stays in bounds");
 	}
-	render_build(&f, a, 0, 30, 50, 1000000, NULL);
+	render_build(&f, a, 0, 30, 50, 1000000, NULL, NULL, 0, NULL);
 	check(f.rows > 0, "empty agent list still renders");
 }
 

@@ -27,6 +27,8 @@ test: tests/test_json.c $(SRC)
 		echo "  SKIP  picker tests (python3 not found)"
 	@command -v python3 >/dev/null && python3 tests/test_menu.py || \
 		echo "  SKIP  menu tests (python3 not found)"
+	@command -v python3 >/dev/null && python3 tests/test_sections.py || \
+		echo "  SKIP  sections tests (python3 not found)"
 
 sanitize: $(SRC) $(MAIN)
 	$(CC) -std=c17 -g -O1 -Wall -Wextra -fsanitize=address,undefined \

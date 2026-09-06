@@ -277,47 +277,66 @@ static void hold_width(int cols)
 /* Move the client that is looking at this sidebar to the clicked agent. The
    client is resolved from our own session rather than left to tmux's notion of
    "current", which is ambiguous with several clients attached. */
+/* The client viewing this sidebar. Keyed on our own pane id, never the session
+   name - a rename left the cached name pointing at nothing, the client came back
+   empty, and the switch fell through to whichever client tmux considered
+   current, usually a different terminal. One ~4ms call. */
+static void resolve_client(char *client, size_t cap)
+{
+	client[0] = '\0';
+	const char *self_pane = getenv("TMUX_PANE");
+	if (self_pane == NULL || *self_pane == '\0')
+		return;
+
+	char list[2048];
+	char *lc[] = { (char *)"tmux", (char *)"list-clients",
+		       (char *)"-t", (char *)self_pane, (char *)"-F",
+		       (char *)"#{client_activity} #{client_name}", NULL };
+	if (capture_all(lc, list, sizeof list) != 0)
+		return;
+
+	/* Two terminals can view one session. Prefer the most recently used -
+	   the one in front of whoever clicked. */
+	long long best = -1;
+	char *save = NULL;
+	for (char *line = strtok_r(list, "\n", &save); line != NULL;
+	     line = strtok_r(NULL, "\n", &save)) {
+		char *sp = strchr(line, ' ');
+		if (sp == NULL)
+			continue;
+		*sp = '\0';
+		long long act = atoll(line);
+		if (act > best) {
+			best = act;
+			snprintf(client, cap, "%s", sp + 1);
+		}
+	}
+}
+
+/* Switch the sidebar's client to a plain session - no agent pane to select. */
+static void jump_to_session(const char *sess)
+{
+	if (sess == NULL || sess[0] == '\0')
+		return;
+	char client[128];
+	resolve_client(client, sizeof client);
+
+	char *with[] = { (char *)"tmux", (char *)"switch-client", (char *)"-c",
+			 client, (char *)"-t", (char *)sess, NULL };
+	char *no[] = { (char *)"tmux", (char *)"switch-client", (char *)"-t",
+		       (char *)sess, NULL };
+	int rc = run_tmux(client[0] != '\0' ? with : no);
+	trace("jump session=%s client=%s rc=%d", sess, client, rc);
+}
+
 static void jump_to(const agent *a)
 {
-	char client[128] = "";
+	char client[128];
 
 	if (a->pane_id[0] == '\0')
 		return;
 
-	/* Key on our own pane id, never the session name: a rename left the
-	   cached name pointing at nothing, the client came back empty, and the
-	   switch fell through to whichever client tmux considered current -
-	   which with several attached is usually a different terminal. Pane ids
-	   do not change, and the lookup is one 4ms call. */
-	const char *self_pane = getenv("TMUX_PANE");
-	if (self_pane != NULL && *self_pane != '\0') {
-		char list[2048];
-		char *lc[] = { (char *)"tmux", (char *)"list-clients",
-			       (char *)"-t", (char *)self_pane, (char *)"-F",
-			       (char *)"#{client_activity} #{client_name}",
-			       NULL };
-		if (capture_all(lc, list, sizeof list) == 0) {
-			/* Two terminals can view one session. Prefer the one
-			   used most recently - it is the one in front of
-			   whoever clicked. */
-			long long best = -1;
-			char *save = NULL;
-			for (char *line = strtok_r(list, "\n", &save);
-			     line != NULL;
-			     line = strtok_r(NULL, "\n", &save)) {
-				char *sp = strchr(line, ' ');
-				if (sp == NULL)
-					continue;
-				*sp = '\0';
-				long long act = atoll(line);
-				if (act > best) {
-					best = act;
-					snprintf(client, sizeof client, "%s",
-						 sp + 1);
-				}
-			}
-		}
-	}
+	resolve_client(client, sizeof client);
 
 	char *with_client[] = {
 		(char *)"tmux",
@@ -467,6 +486,55 @@ static void open_menu(const agent *a)
 	}
 }
 
+/* Middle-click on a non-agent session row: a small menu to jump or kill it.
+   Pure tmux commands, so no binary action is needed; -M -O keep it from
+   closing on the button release (see open_menu). */
+static void open_session_menu(const char *sess)
+{
+	char title[128], jump[192], killc[320];
+	snprintf(title, sizeof title, " #[align=centre]%s ", sess);
+	snprintf(jump, sizeof jump, "switch-client -t '%s'", sess);
+	snprintf(killc, sizeof killc,
+		 "confirm-before -p 'kill %s? (y/n)' \"kill-session -t '%s'\"",
+		 sess, sess);
+
+	char *argv[16];
+	int k = 0;
+	argv[k++] = (char *)"tmux";
+	argv[k++] = (char *)"display-menu";
+	argv[k++] = (char *)"-O";
+	if (menu_mouse_ok())
+		argv[k++] = (char *)"-M";
+	argv[k++] = (char *)"-T";
+	argv[k++] = title;
+	argv[k++] = (char *)"-x";
+	argv[k++] = (char *)"P";
+	argv[k++] = (char *)"-y";
+	argv[k++] = (char *)"P";
+	argv[k++] = (char *)"Jump to";
+	argv[k++] = (char *)"j";
+	argv[k++] = jump;
+	argv[k++] = (char *)"Kill";
+	argv[k++] = (char *)"k";
+	argv[k++] = killc;
+	argv[k++] = NULL;
+
+	pid_t child = fork();
+	if (child == 0) {
+		pid_t grandchild = fork();
+		if (grandchild == 0) {
+			execvp("tmux", argv);
+			_exit(127);
+		}
+		_exit(0);
+	}
+	if (child > 0) {
+		int st;
+		while (waitpid(child, &st, 0) < 0 && errno == EINTR)
+			;
+	}
+}
+
 static void trace(const char *fmt, ...)
 {
 	const char *path = getenv("AGENT_SIDEBAR_TRACE");
@@ -511,16 +579,26 @@ static void act_on_click(const frame *f, const agent *a, int n, int button,
 	if (idx < 0 || idx >= f->rows)
 		return;
 	int which = f->row_agent[idx];
-	trace("click button=%d row=%d -> agent %d", which_button, row, which);
-	if (which < 0 || which >= n)
+	if (which >= 0 && which < n) {
+		trace("click button=%d row=%d -> agent %d", which_button, row,
+		      which);
+		if (which_button == 0)
+			jump_to(&a[which]);
+		else if (which_button == 1)
+			open_menu(&a[which]);
+		else
+			agents_park_toggle(a[which].sess);
 		return;
+	}
 
-	if (which_button == 0)
-		jump_to(&a[which]);
-	else if (which_button == 1)
-		open_menu(&a[which]);
-	else
-		agents_park_toggle(a[which].sess);
+	if (f->row_session[idx][0] != '\0') { /* a non-agent session row */
+		trace("click button=%d row=%d -> session %s", which_button, row,
+		      f->row_session[idx]);
+		if (which_button == 0)
+			jump_to_session(f->row_session[idx]);
+		else if (which_button == 1)
+			open_session_menu(f->row_session[idx]);
+	}
 }
 
 static void handle_input(const frame *f, const agent *a, int n)
@@ -681,6 +759,38 @@ static void usage(void)
 	      "  agent-sidebar --width N  force a width (with --once)\n"
 	      "  agent-sidebar --rows N   force a height (with --once)\n",
 	      stderr);
+}
+
+static char g_legend[512];
+static char g_exclude[256];
+static int g_show_sessions;
+
+/* Read the two display options once. They change only on a config reload,
+   which does not reach a running process, so there is nothing to poll. */
+static void read_config(void)
+{
+	char buf[512];
+	char *lg[] = { (char *)"tmux", (char *)"show-option", (char *)"-gqv",
+		       (char *)"@agent_sidebar_legend", NULL };
+	if (capture_all(lg, buf, sizeof buf) == 0) {
+		char *nl = strchr(buf, '\n');
+		if (nl != NULL)
+			*nl = '\0';
+		snprintf(g_legend, sizeof g_legend, "%s", buf);
+	}
+	char *so[] = { (char *)"tmux", (char *)"show-option", (char *)"-gqv",
+		       (char *)"@agent_sidebar_sessions", NULL };
+	if (capture_all(so, buf, sizeof buf) == 0) {
+		char c = buf[0];
+		g_show_sessions = c == 'o' || c == '1' || c == 't' || c == 'y';
+	}
+	char *ex[] = { (char *)"tmux", (char *)"show-option", (char *)"-gqv",
+		       (char *)"@agent_sidebar_exclude", NULL };
+	if (capture_all(ex, g_exclude, sizeof g_exclude) == 0) {
+		char *nl = strchr(g_exclude, '\n');
+		if (nl != NULL)
+			*nl = '\0';
+	}
 }
 
 int main(int argc, char **argv)
@@ -881,6 +991,7 @@ int main(int argc, char **argv)
 
 	saved_argv = argv;
 	self_record();
+	read_config();
 
 	int cols, rows;
 	term_size(STDOUT_FILENO, &cols, &rows);
@@ -942,9 +1053,14 @@ int main(int argc, char **argv)
 		}
 		char self[64];
 		agents_self_session(self, sizeof self);
+		char sessions[64][64];
+		int nsess = g_show_sessions
+				    ? agents_sessions(sessions, 64, agents, n,
+						      g_exclude)
+				    : 0;
 		render_build(&cur, agents, n, cols,
 			     force_rows > 0 ? force_rows : FRAME_ROWS,
-			     now_ms(), self);
+			     now_ms(), self, sessions, nsess, g_legend);
 		for (int i = 0; i < cur.rows; i++)
 			printf("%s\033[0m\n", cur.line[i]);
 		return 0;
@@ -1012,7 +1128,13 @@ int main(int argc, char **argv)
 			n = 0;
 		char self[64];
 		agents_self_session(self, sizeof self);
-		render_build(&cur, agents, n, cols, rows, now_ms(), self);
+		char sessions[64][64];
+		int nsess = g_show_sessions
+				    ? agents_sessions(sessions, 64, agents, n,
+						      g_exclude)
+				    : 0;
+		render_build(&cur, agents, n, cols, rows, now_ms(), self,
+			     sessions, nsess, g_legend);
 		render_flush(STDOUT_FILENO, &cur, &prev, force);
 		force = 0;
 

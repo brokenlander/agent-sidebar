@@ -46,4 +46,9 @@ void agents_invalidate(void);
    Empty when unknown. Returns 1 when found. */
 int agents_self_session(char *dst, size_t cap);
 
+/* tmux sessions with no agent in them, from the cached pane map, sorted by
+   name. Call after agents_load so the map is fresh. Returns the count. */
+int agents_sessions(char out[][64], int cap, const agent *a, int n,
+		    const char *exclude);
+
 #endif
