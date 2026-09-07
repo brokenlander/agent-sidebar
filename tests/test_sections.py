@@ -35,7 +35,7 @@ try:
     tm("new-session", "-d", "-s", "plainbox", "-x", "100", "-y", "44", "sleep 600")
     tm("new-session", "-d", "-s", "victim", "-x", "100", "-y", "44", "sleep 600")
     tm("set", "-g", "@agent_sidebar_sessions", "on")
-    tm("set", "-g", "@agent_sidebar_legend", "e sidebar|o agents|y sesh")
+    tm("set", "-g", "@agent_sidebar_legend", "e sidebar;o agents;y sesh")
     tm("set", "-g", "mouse", "on")
 
     pid = tm("list-panes", "-t", "alpha", "-F", "#{pane_pid}").split()[0]

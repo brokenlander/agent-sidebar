@@ -18,7 +18,7 @@ const char *status_colour_for(agent_status s);
 
 /* self_sess: the session the sidebar runs in; its agent is drawn as current.
    sessions/nsessions: tmux sessions with no agent, listed below the agents.
-   legend: "key label|key label|..." shown as a key cheatsheet at the bottom.
+   legend: "key label;key label;..." shown as a key cheatsheet at the bottom.
    Either extra section is skipped when empty. */
 void render_build(frame *f, const agent *a, int n, int cols, int rows,
 		  long long now_ms, const char *self_sess,

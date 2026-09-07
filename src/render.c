@@ -159,7 +159,8 @@ static void section_head(frame *f, int cols, const char *label)
 	put_line(f, &lb, -1);
 }
 
-/* "key label|key label|..." as one or two columns of dim rows, key accented. */
+/* "key label;key label;..." as one or two columns of dim rows, key accented.
+   Entries are ';'-separated so a key can be '|' or '-' (the split-pane keys). */
 static void render_legend(frame *f, int cols, const char *legend)
 {
 	int per_line = cols >= 24 ? 2 : 1;
@@ -168,7 +169,7 @@ static void render_legend(frame *f, int cols, const char *legend)
 	int in_line = 0;
 
 	for (const char *p = legend; *p != '\0';) {
-		const char *bar = strchr(p, '|');
+		const char *bar = strchr(p, ';');
 		size_t len = bar != NULL ? (size_t)(bar - p) : strlen(p);
 		char entry[64];
 		if (len >= sizeof entry)
@@ -278,7 +279,7 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 		int per_line = cols >= 24 ? 2 : 1;
 		int entries = 1;
 		for (const char *p = legend; *p != '\0'; p++)
-			if (*p == '|')
+			if (*p == ';')
 				entries++;
 		legend_lines = (entries + per_line - 1) / per_line;
 	}
