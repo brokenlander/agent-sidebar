@@ -9,6 +9,16 @@ mechanism it actually offers, and the sidebar stays ignorant of the difference.
 | opencode | plugin | `producers/opencode/plugin.js`, via its lifecycle events |
 | codex | plugin (todo) | in its hooks list upstream; unauthenticated here so far |
 
+The opencode plugin is installed as a symlink at
+`~/.config/opencode/plugins/agent-sidebar.js`. Verified live 2026-09-10: it
+writes its file within ~8s of opencode starting, and removes it on exit, so a
+killed agent leaves no stale row.
+
+Reading what an agent last *said* is a separate thing and needs no producer at
+all — every provider already streams its conversation to disk. `pm-lastsaid` in
+the dotfiles repo has one adapter per format (claude JSONL, codex rollout JSONL,
+opencode SQLite).
+
 ## The file format
 
 One file per live agent process, named for its pid:
