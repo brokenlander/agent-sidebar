@@ -420,9 +420,13 @@ static void open_menu(const agent *a)
 		 "\"run-shell '%s --kill %s'\"",
 		 a->sess, self, pid);
 
-	/* the typed name is the only thing a shell sees, and it stays quoted */
+	/* the typed name is the only thing a shell sees, and it stays quoted.
+	   No -I: pre-filling the current name means clearing it before you can
+	   type, and renaming to a variation of the old name is the rare case.
+	   The prompt carries the context instead, so nothing is lost. Enter on
+	   an empty field is refused by --rename-session, not acted on. */
 	snprintf(rename, sizeof rename,
-		 "command-prompt -p 'rename to:' -I '%s' "
+		 "command-prompt -p 'rename %s to:' "
 		 "{ run-shell '%s --rename-session %s \"%%%%\"' }",
 		 a->sess, self, pid);
 

@@ -51,7 +51,9 @@ scratch popup wants a bare terminal, not the panel.
 - **Left-click a row** to jump to that agent: the client looking at the sidebar
   switches session, window and pane in one go.
 - **Middle-click a row** for a menu: jump, park/un-park, rename the tmux
-  session, start another agent, or kill one. tmux renders the menu itself via
+  session, start another agent, or kill one. Rename starts from an EMPTY
+  field — the old name is in the prompt, not in your way — and an empty
+  answer is refused rather than acted on. tmux renders the menu itself via
   `display-menu`, so there is no menu widget here - just a command string.
   Choose an item with the mouse or its bracketed key. Rename pre-fills the
   current name and moves the park entry with it, so a parked agent does not
