@@ -549,7 +549,7 @@ static int cmp_agent(const void *a, const void *b)
 	return 0;
 }
 
-static long long g_idle_wait_ms = 10 * 60 * 1000; /* 10 min */
+static long long g_idle_wait_ms = 30 * 60 * 1000; /* 30 min */
 
 void agents_set_idle_wait(long long secs)
 {
