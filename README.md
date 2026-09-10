@@ -22,6 +22,16 @@ Amber needs you, green is idle and yours, red is working. An agent that has
 backgrounded a shell command still counts as idle - it is not a state you act
 on differently. Sorted so whatever needs you is at the top.
 
+**Amber is mostly inferred, not reported.** A producer can say `waiting`
+outright - opencode does, on a permission prompt - but Claude Code never does:
+running with permissions bypassed it is never blocked on one, so it only ever
+reports busy, idle or shell. An agent that has been idle a while is waiting on
+you whether or not it says so, so idle past `@agent_sidebar_idle_wait` minutes
+(default 10, `0` disables) is promoted to amber. That is a display rule over
+`statusUpdatedAt`, which the age column already shows - no hook, no extra state
+file, and it applies to sessions that are already running. Parked agents are
+exempt: muted is muted.
+
 ## One control
 
 `prefix + e` is one switch for every session. Pressed in a window without a

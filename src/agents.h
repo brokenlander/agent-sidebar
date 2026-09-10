@@ -32,6 +32,14 @@ int agents_load(agent *out, int cap);
 
 const char *agent_status_label(agent_status s);
 
+/* An agent idle longer than this has stopped being "your turn" and started
+   being "you forgot about me": it is reported as ST_WAITING so it colours and
+   sorts with the ones that need you. Seconds; 0 disables the promotion.
+   Claude Code never writes a waiting status of its own - under bypass it is
+   never blocked on a prompt - so without this the waiting state is dead for
+   every agent but opencode. */
+void agents_set_idle_wait(long long secs);
+
 /* Park list: tmux session names the user has muted, one per line, in
    $XDG_STATE_HOME/agent-sidebar/parked (default ~/.local/state/...). */
 void agents_park_toggle(const char *sess);

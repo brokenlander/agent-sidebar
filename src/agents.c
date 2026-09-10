@@ -549,6 +549,21 @@ static int cmp_agent(const void *a, const void *b)
 	return 0;
 }
 
+static long long g_idle_wait_ms = 10 * 60 * 1000; /* 10 min */
+
+void agents_set_idle_wait(long long secs)
+{
+	g_idle_wait_ms = secs > 0 ? secs * 1000 : 0;
+}
+
+static long long now_ms(void)
+{
+	struct timespec ts;
+	if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+		return 0;
+	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static int scan_dir(const char *dir, agent *out, int cap, int n)
 {
 	DIR *d = opendir(dir);
@@ -668,6 +683,16 @@ int agents_load(agent *out, int cap)
 		return 0;
 
 	resolve_panes(out, n);
+
+	if (g_idle_wait_ms > 0) {
+		long long now = now_ms();
+		for (int i = 0; i < n; i++) {
+			if (out[i].status != ST_IDLE || out[i].seen_ms <= 0)
+				continue;
+			if (now - out[i].seen_ms >= g_idle_wait_ms)
+				out[i].status = ST_WAITING;
+		}
+	}
 
 	park_load();
 	for (int i = 0; i < n; i++)

@@ -791,6 +791,16 @@ static void read_config(void)
 		if (nl != NULL)
 			*nl = '\0';
 	}
+	/* Minutes of idleness after which an agent reads as wanting you. 0 turns
+	   the promotion off and leaves idle permanently green. */
+	char *iw[] = { (char *)"tmux", (char *)"show-option", (char *)"-gqv",
+		       (char *)"@agent_sidebar_idle_wait", NULL };
+	if (capture_all(iw, buf, sizeof buf) == 0 && buf[0] != '\0') {
+		char *end = NULL;
+		long mins = strtol(buf, &end, 10);
+		if (end != buf && mins >= 0)
+			agents_set_idle_wait((long long)mins * 60);
+	}
 }
 
 int main(int argc, char **argv)
