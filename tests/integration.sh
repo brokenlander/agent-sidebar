@@ -15,7 +15,9 @@ export XDG_STATE_HOME="$TMP/state"        # never touch the real park list
 export CLAUDE_CONFIG_DIR="$TMP/claude"    # never read the real agents
 mkdir -p "$CLAUDE_CONFIG_DIR/sessions" "$XDG_STATE_HOME"
 
-TM="tmux -L $SOCK"
+# -f /dev/null: the test server must not source ~/.tmux.conf, whose
+# @agent_sidebar_* options (sessions section, legend) change the frame.
+TM="tmux -L $SOCK -f /dev/null"
 SOCKPATH="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SOCK"
 # Any invocation of the binary must talk to the TEST server. Without this its
 # tmux calls go to the default socket - which once renamed a real session.
