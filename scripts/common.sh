@@ -3,8 +3,7 @@
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$DIR/agent-sidebar"
 
-width="$(tmux show-option -gqv @agent_sidebar_width)"
-[ -z "$width" ] && width=28
+width=28
 
 # The toggle and the window-linked hook can reach a new window at the same
 # moment, and each would find it empty and split it. One lock around both
@@ -21,17 +20,20 @@ sidebar_in() {
 		awk '$2 == "agent-sidebar" { print $1; exit }'
 }
 
-# A window whose session matches @agent_sidebar_exclude (a case glob, e.g.
+# A window whose session matches @agent_sidebar_exclude (case globs, e.g.
 # "scratch" or "scratch|popup*") never gets a sidebar: a scratch popup or other
-# utility session wants a bare terminal, not the panel.
+# utility session wants a bare terminal, not the panel. A '|' from a variable
+# is literal to case, hence the split.
 excluded() {
 	pat="$(tmux show-option -gqv @agent_sidebar_exclude)"
 	[ -z "$pat" ] && return 1
 	sess="$(tmux display-message -p -t "$1" '#{session_name}' 2>/dev/null)"
-	case "$sess" in
-	$pat) return 0 ;;
-	*)    return 1 ;;
-	esac
+	while :; do
+		one="${pat%%|*}"
+		case "$sess" in $one) return 0 ;; esac
+		[ "$one" = "$pat" ] && return 1
+		pat="${pat#*|}"
+	done
 }
 
 open_in() {

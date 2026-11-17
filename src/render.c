@@ -81,6 +81,7 @@ static void lb_pad_to(linebuf *lb, int col)
 #define C_HEAD "\033[38;2;122;162;247m"
 #define C_NAME "\033[38;2;145;180;250m" /* running agents */
 #define C_SELF "\033[38;2;240;244;255m" /* the agent of this session: near white */
+#define C_FROZEN "\033[38;2;61;89;161m" /* deep blue - kept for later */
 
 static const char *status_colour(agent_status s);
 
@@ -89,17 +90,23 @@ const char *status_colour_for(agent_status s)
 	return status_colour(s);
 }
 
+const char *frozen_colour(void)
+{
+	return C_FROZEN;
+}
+
 static const char *status_colour(agent_status s)
 {
 	switch (s) {
-	case ST_WAITING: return "\033[38;2;224;175;104m"; /* amber - needs you */
+	case ST_ASKING:  return "\033[38;2;215;166;255m"; /* purple - asking you */
+	case ST_WAITING: return "\033[38;2;224;175;104m"; /* amber - forgotten */
 	case ST_IDLE:    return "\033[38;2;158;206;106m"; /* green - your turn */
 	case ST_BUSY:    return "\033[38;2;247;118;142m"; /* red   - working */
 	default:         return C_DIM;
 	}
 }
 
-static void fmt_age(char *dst, size_t cap, long long now_ms, long long seen_ms)
+void render_age(char *dst, size_t cap, long long now_ms, long long seen_ms)
 {
 	if (seen_ms <= 0) {
 		snprintf(dst, cap, "-");
@@ -133,6 +140,7 @@ static void put_line(frame *f, const linebuf *lb, int agent_index)
 	memcpy(f->line[f->rows], lb->buf, lb->len + 1);
 	f->row_agent[f->rows] = agent_index;
 	f->row_session[f->rows][0] = '\0';
+	f->row_sid[f->rows][0] = '\0';
 	f->rows++;
 }
 
@@ -159,76 +167,25 @@ static void section_head(frame *f, int cols, const char *label)
 	put_line(f, &lb, -1);
 }
 
-/* "key label;key label;..." as one or two columns of dim rows, key accented.
-   Entries are ';'-separated so a key can be '|' or '-' (the split-pane keys). */
-static void render_legend(frame *f, int cols, const char *legend)
-{
-	int per_line = cols >= 24 ? 2 : 1;
-	int colw = cols / per_line;
-	linebuf lb;
-	int in_line = 0;
-
-	for (const char *p = legend; *p != '\0';) {
-		const char *bar = strchr(p, ';');
-		size_t len = bar != NULL ? (size_t)(bar - p) : strlen(p);
-		char entry[64];
-		if (len >= sizeof entry)
-			len = sizeof entry - 1;
-		memcpy(entry, p, len);
-		entry[len] = '\0';
-
-		if (in_line == 0)
-			lb_init(&lb, cols);
-		else
-			lb_pad_to(&lb, colw * in_line);
-
-		lb_text(&lb, " ");
-		char *sp = strchr(entry, ' ');
-		if (sp != NULL) {
-			*sp = '\0';
-			lb_raw(&lb, C_NAME);
-			lb_text(&lb, entry);
-			lb_raw(&lb, C_RESET C_DIM);
-			lb_text(&lb, " ");
-			lb_text(&lb, sp + 1);
-			lb_raw(&lb, C_RESET);
-		} else {
-			lb_raw(&lb, C_DIM);
-			lb_text(&lb, entry);
-			lb_raw(&lb, C_RESET);
-		}
-
-		if (++in_line >= per_line) {
-			put_line(f, &lb, -1);
-			in_line = 0;
-		}
-		if (bar == NULL)
-			break;
-		p = bar + 1;
-	}
-	if (in_line > 0)
-		put_line(f, &lb, -1);
-}
-
 void render_build(frame *f, const agent *a, int n, int cols, int rows,
 		  long long now_ms, const char *self_sess,
-		  char (*sessions)[64], int nsessions, const char *legend)
+		  const tsession *sessions, int nsessions, int keys)
 {
 	linebuf lb;
 	int count[ST_UNKNOWN + 1] = { 0 };
 
 	f->rows = 0;
-	for (int i = 0; i < FRAME_ROWS; i++) {
-		f->row_agent[i] = -1;
-		f->row_session[i][0] = '\0';
-	}
+	f->keys_row = -1;
 	if (cols < 12)
 		cols = 12;
 
 	int nparked = 0;
+	int nfrozen = 0;
 	for (int i = 0; i < n; i++) {
 		if (a[i].parked)
 			nparked++;
+		else if (a[i].frozen)
+			nfrozen++;
 		else
 			count[a[i].status]++;
 	}
@@ -256,6 +213,15 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 		lb_text(&lb, t);
 		lb_raw(&lb, C_RESET);
 	}
+	if (nfrozen > 0) {
+		char t[32];
+		snprintf(t, sizeof t, " %d", nfrozen);
+		lb_raw(&lb, C_FROZEN);
+		lb_text(&lb, " \xe2\x97\x8f");
+		lb_raw(&lb, C_RESET C_DIM);
+		lb_text(&lb, t);
+		lb_raw(&lb, C_RESET);
+	}
 	for (int s = 0; s <= ST_UNKNOWN; s++) {
 		if (count[s] == 0)
 			continue;
@@ -271,33 +237,19 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 
 	section_rule(f, cols);
 
-	/* Reserve the bottom sections so a long agent list never pushes them
-	   off: agents fill the top and overflow with a "+N more" line, then the
-	   other-sessions and key-legend sections follow. */
-	int legend_lines = 0;
-	if (legend != NULL && legend[0] != '\0') {
-		int per_line = cols >= 24 ? 2 : 1;
-		int entries = 1;
-		for (const char *p = legend; *p != '\0'; p++)
-			if (*p == ';')
-				entries++;
-		legend_lines = (entries + per_line - 1) / per_line;
-	}
-
+	/* Reserve the bottom so a long agent list never pushes it off: agents
+	   fill the top and overflow with a "+N more" line, then the
+	   other-sessions section, then the shortcuts button on the last row. */
 	int avail = rows - f->rows;
 	if (avail < 1)
 		avail = 1;
 
-	int legend_h = legend_lines > 0 ? 2 + legend_lines : 0;
-	if (legend_h > avail - 1) { /* no room: drop the legend */
-		legend_h = 0;
-		legend_lines = 0;
-	}
+	int keys_h = keys && avail > 1 ? 1 : 0;
 
 	int sess_shown = nsessions;
 	int sess_h = nsessions > 0 ? 2 + nsessions : 0;
-	if (sess_h > avail - legend_h - 1) { /* trim sessions to fit */
-		int budget = avail - legend_h - 1; /* leave >= 1 row for agents */
+	if (sess_h > avail - keys_h - 1) { /* trim sessions to fit */
+		int budget = avail - keys_h - 1; /* leave >= 1 row for agents */
 		if (budget >= 3) {
 			sess_shown = budget - 3; /* rule + head + "+N more" */
 			sess_h = 2 + sess_shown + 1;
@@ -311,7 +263,7 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 	   are hidden: silently dropping them would look like they had been
 	   deleted, and the ones that vanish are the bottom of the sort, which
 	   is exactly where parked agents live. */
-	int room = avail - legend_h - sess_h;
+	int room = avail - keys_h - sess_h;
 	int shown = n;
 	if (room < 1)
 		room = 1;
@@ -323,7 +275,7 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 	for (int i = 0; i < shown; i++) {
 		const agent *g = &a[i];
 		char age[16];
-		fmt_age(age, sizeof age, now_ms, g->seen_ms);
+		render_age(age, sizeof age, now_ms, g->seen_ms);
 
 		const char *label = g->sess[0] != '\0' ? g->sess : g->name;
 		if (label[0] == '\0')
@@ -334,6 +286,12 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 			/* a hollow, dimmed dot: still visible, clearly set aside */
 			lb_raw(&lb, C_DIM);
 			lb_text(&lb, " \xe2\x97\x8b ");
+			lb_text(&lb, label);
+			lb_raw(&lb, C_RESET);
+		} else if (g->frozen) {
+			/* deep blue dot and name: kept, not muted */
+			lb_raw(&lb, C_FROZEN);
+			lb_text(&lb, " \xe2\x97\x8f ");
 			lb_text(&lb, label);
 			lb_raw(&lb, C_RESET);
 		} else {
@@ -392,11 +350,13 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 			lb_raw(&lb, C_DIM);
 			lb_text(&lb, " \xc2\xb7 "); /* · */
 			lb_raw(&lb, C_RESET C_NAME);
-			lb_text(&lb, sessions[i]);
+			lb_text(&lb, sessions[i].name);
 			lb_raw(&lb, C_RESET);
 			put_line(f, &lb, -1);
 			snprintf(f->row_session[f->rows - 1],
-				 sizeof f->row_session[0], "%s", sessions[i]);
+				 sizeof f->row_session[0], "%s", sessions[i].name);
+			snprintf(f->row_sid[f->rows - 1], sizeof f->row_sid[0],
+				 "%s", sessions[i].id);
 		}
 		if (sess_shown < nsessions) {
 			char t[32];
@@ -409,12 +369,36 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 		}
 	}
 
-	/* Key legend. */
-	if (legend_lines > 0) {
-		section_rule(f, cols);
-		section_head(f, cols, " keys");
-		render_legend(f, cols, legend);
+	/* pinned to the last row, so it stays put while the list changes */
+	if (keys_h > 0) {
+		while (rows < FRAME_ROWS && f->rows < rows - 1) {
+			lb_init(&lb, cols);
+			put_line(f, &lb, -1);
+		}
+		if (f->rows < FRAME_ROWS) {
+			lb_init(&lb, cols);
+			lb_raw(&lb, C_NAME);
+			lb_text(&lb, " ?");
+			lb_raw(&lb, C_RESET C_DIM);
+			lb_text(&lb, " shortcuts");
+			lb_raw(&lb, C_RESET);
+			f->keys_row = f->rows;
+			put_line(f, &lb, -1);
+		}
 	}
+}
+
+/* Only the rows in use: the whole frame is a quarter of a megabyte. */
+static void render_copy(frame *dst, const frame *src)
+{
+	for (int i = 0; i < src->rows; i++) {
+		memcpy(dst->line[i], src->line[i], strlen(src->line[i]) + 1);
+		dst->row_agent[i] = src->row_agent[i];
+		memcpy(dst->row_session[i], src->row_session[i], sizeof dst->row_session[i]);
+		memcpy(dst->row_sid[i], src->row_sid[i], sizeof dst->row_sid[i]);
+	}
+	dst->rows = src->rows;
+	dst->keys_row = src->keys_row;
 }
 
 long render_flush(int fd, const frame *cur, frame *prev, int force)
@@ -423,13 +407,14 @@ long render_flush(int fd, const frame *cur, frame *prev, int force)
 	size_t o = 0;
 	long total = 0;
 
-	int high = cur->rows > prev->rows ? cur->rows : prev->rows;
+	/* A forced repaint follows a resize, and the frame's rows are all it
+	   knows about. Clear the screen and its history so nothing tmux moved
+	   or wrapped outside those rows survives. Never address a row past a
+	   shrunken pane: the cursor clamps, and the blank lands on the last row. */
+	int high = force || cur->rows > prev->rows ? cur->rows : prev->rows;
 	if (high > FRAME_ROWS)
 		high = FRAME_ROWS;
 
-	/* A forced repaint follows a resize, and the frame's rows are all it
-	   knows about. Clear the screen and its history so nothing tmux moved
-	   or wrapped outside those rows survives. */
 	if (force) {
 		memcpy(out, "\033[2J\033[3J", 8);
 		o = 8;
@@ -469,6 +454,6 @@ long render_flush(int fd, const frame *cur, frame *prev, int force)
 		total += (long)o;
 	}
 
-	memcpy(prev, cur, sizeof *prev);
+	render_copy(prev, cur);
 	return total;
 }

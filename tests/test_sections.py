@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""The sidebar's optional sections: non-agent tmux sessions and a key legend.
+"""The sidebar's optional sections: non-agent tmux sessions and the shortcuts.
 
 With @agent_sidebar_sessions on, sessions holding no agent are listed below the
-agents and are clickable to jump. @agent_sidebar_legend paints a key cheatsheet
-at the bottom.
+agents and are clickable to jump. With @agent_sidebar_legend set, the last row
+is one button that opens the shortcuts as a tmux menu.
 """
 import fcntl, json, os, pty, re, select, shutil, struct, subprocess, sys, tempfile, termios, time
 
@@ -32,8 +32,11 @@ def tm(*a):
 print("sections tests")
 try:
     tm("new-session", "-d", "-s", "alpha", "-x", "100", "-y", "44", "sleep 600")
-    tm("new-session", "-d", "-s", "plainbox", "-x", "100", "-y", "44", "sleep 600")
-    tm("new-session", "-d", "-s", "victim", "-x", "100", "-y", "44", "sleep 600")
+    # names tmux would misread in a command: '.' as session.pane, a quote or
+    # ';' as the end of one
+    tm("new-session", "-d", "-s", "plain.box", "-x", "100", "-y", "44", "sleep 600")
+    evil = "victim'; set -g @pwned 1; display '"
+    tm("new-session", "-d", "-s", evil, "-x", "100", "-y", "44", "sleep 600")
     tm("set", "-g", "@agent_sidebar_sessions", "on")
     tm("set", "-g", "@agent_sidebar_legend", "e sidebar;o agents;y sesh")
     tm("set", "-g", "mouse", "on")
@@ -79,22 +82,42 @@ try:
             tm("list-panes", "-t", "host", "-F", "#{pane_id} #{pane_current_command}").splitlines()
             if l.endswith("agent-sidebar")][0]
     check(wait(lambda: "alpha" in view(), 5), "the agent is listed")
-    check(wait(lambda: "sessions" in view() and "plainbox" in view(), 5),
+    check(wait(lambda: "sessions" in view() and "plain.box" in view(), 5),
           "a non-agent session is listed in its own section")
     check("alpha" not in view().split("sessions")[1] if "sessions" in view() else False,
           "the agent session is not duplicated under sessions")
-    check("keys" in view() and "sesh" in view(), "the key legend is shown")
+    def last_row():
+        return view().rstrip("\n").split("\n")[-1]
+    check(wait(lambda: "shortcuts" in last_row(), 5) and "sesh" not in view(),
+          "the shortcuts are one button on the last row")
+    if "shortcuts" in last_row():
+        # the status line may sit above the pane, so try the rows around it
+        brow = len(view().rstrip("\n").split("\n"))
+        listed = False
+        for cand in range(brow, brow + 3):
+            drain(0.3)
+            os.write(fd, ("\x1b[<0;5;%dM" % cand).encode()); time.sleep(0.1)
+            os.write(fd, ("\x1b[<0;5;%dm" % cand).encode())
+            shown, end = b"", time.time() + 2
+            while time.time() < end and not (b"sesh" in shown and b"(y)" in shown):
+                if select.select([fd], [], [], 0.1)[0]:
+                    shown += os.read(fd, 65536)
+            listed = b"sesh" in shown and b"(y)" in shown
+            if listed:
+                os.write(fd, b"q"); drain(0.5)
+                break
+        check(listed, "clicking it lists the shortcuts with their keys")
 
-    # click the plainbox row -> the client jumps to it
+    # click the plain.box row -> the client jumps to it
     rows = view().split("\n")
-    prow = [i + 1 for i, l in enumerate(rows) if "plainbox" in l]
+    prow = [i + 1 for i, l in enumerate(rows) if "plain.box" in l]
     jumped = False
     if prow:
         for cand in range(prow[0] - 1, prow[0] + 2):
             tm("switch-client", "-t", "host"); time.sleep(0.2); drain(0.3)
             os.write(fd, ("\x1b[<0;5;%dM" % cand).encode()); time.sleep(0.1)
             os.write(fd, ("\x1b[<0;5;%dm" % cand).encode())
-            if wait(lambda: tm("list-clients", "-F", "#{client_session}").strip() == "plainbox", 2):
+            if wait(lambda: tm("list-clients", "-F", "#{client_session}").strip() == "plain.box", 2):
                 jumped = True
                 break
     check(jumped, "clicking a session row jumps to it")
@@ -113,9 +136,18 @@ try:
                 tm("switch-client", "-t", "host"); time.sleep(0.2); drain(0.3)
                 os.write(fd, ("\x1b[<0;5;%dM" % cand).encode()); time.sleep(0.1)
                 os.write(fd, ("\x1b[<0;5;%dm" % cand).encode())
-                if wait(lambda: tm("list-clients", "-F", "#{client_session}").strip() == "victim", 2):
+                if wait(lambda: tm("list-clients", "-F", "#{client_session}").strip() == evil, 2):
                     term = cand
                     break
+        jumped = False
+        if term is not None:
+            tm("switch-client", "-t", "host"); time.sleep(0.3); drain(0.3)
+            os.write(fd, ("\x1b[<1;5;%dM" % term).encode()); time.sleep(0.4)
+            os.write(fd, ("\x1b[<1;5;%dm" % term).encode()); time.sleep(0.5); drain(0.3)
+            os.write(fd, b"j"); time.sleep(0.4); drain(0.3)   # Jump to
+            jumped = wait(lambda: tm("list-clients", "-F", "#{client_session}").strip() == evil, 2)
+        check(jumped and tm("show", "-gqv", "@pwned").strip() == "",
+              "a name in a menu command stays a name")
         killed = False
         if term is not None:
             tm("switch-client", "-t", "host"); time.sleep(0.3); drain(0.3)
@@ -123,13 +155,17 @@ try:
             os.write(fd, ("\x1b[<1;5;%dm" % term).encode()); time.sleep(0.5); drain(0.3)  # release
             os.write(fd, b"k"); time.sleep(0.4); drain(0.3)   # Kill
             os.write(fd, b"y"); time.sleep(0.4); drain(0.3)   # confirm
-            killed = wait(lambda: "victim" not in tm("list-sessions", "-F", "#{session_name}").split(), 3)
+            killed = wait(lambda: "victim" not in tm("list-sessions", "-F", "#{session_name}"), 3)
         check(killed, "middle-click a session -> Kill removes it")
     else:
         print("  SKIP  middle-click kill (tmux %s has no -M)" % ver)
 finally:
     tm("kill-server")
     shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        os.unlink("/tmp/tmux-%d/%s" % (os.getuid(), sock))
+    except OSError:
+        pass
 
 print()
 if fails:

@@ -13,6 +13,7 @@ TMP="$(mktemp -d)"
 SOCK="agent-sidebar-test-$$"
 export XDG_STATE_HOME="$TMP/state"        # never touch the real park list
 export CLAUDE_CONFIG_DIR="$TMP/claude"    # never read the real agents
+unset TMUX_PANE                           # a pane of ours means nothing there
 mkdir -p "$CLAUDE_CONFIG_DIR/sessions" "$XDG_STATE_HOME"
 
 # -f /dev/null: the test server must not source ~/.tmux.conf, whose
@@ -22,26 +23,29 @@ SOCKPATH="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SOCK"
 # Any invocation of the binary must talk to the TEST server. Without this its
 # tmux calls go to the default socket - which once renamed a real session.
 sb() { TMUX="$SOCKPATH,0,0" "$BIN" "$@"; }
+ROOT="$(dirname "$BIN")"
+tm_env() { TMUX="$SOCKPATH,0,0" "$@"; }
 fails=0
 ok()   { printf '  ok    %s\n' "$1"; }
 fail() { printf '  FAIL  %s\n' "$1"; fails=$((fails + 1)); }
 check(){ if [ "$1" = 0 ]; then ok "$2"; else fail "$2"; fi; }
 
-cleanup() { $TM kill-server 2>/dev/null; rm -rf "$TMP"; }
+cleanup() { $TM kill-server 2>/dev/null; rm -rf "$TMP"; rm -f "$SOCKPATH"; }
 trap cleanup EXIT
 
 # --- fixture -----------------------------------------------------------------
 # procStart is field 22 of /proc/<pid>/stat, counted after the last ')'
 proc_start() { awk '{ n=split(substr($0, index($0,")")+2), f, " "); print f[20] }' "/proc/$1/stat"; }
 
-make_agent() { # <session> <status>
+make_agent() { # <session> <status> [statusUpdatedAt ms]
 	$TM new-session -d -s "$1" -x 100 -y 30 "sleep 600" 2>/dev/null
 	local pid; pid=$($TM list-panes -t "$1" -F '#{pane_pid}' | head -1)
 	cat > "$CLAUDE_CONFIG_DIR/sessions/$pid.json" <<EOF
 {"pid":$pid,"procStart":"$(proc_start "$pid")","status":"$2","cwd":"$TMP/work",
- "name":"$1","kind":"interactive"}
+ "name":"$1","kind":"interactive","statusUpdatedAt":${3:-0}}
 EOF
 }
+pid_of() { $TM list-panes -t "$1" -F '#{pane_pid}' | head -1; }
 
 click() { # <pane> <button> <row>
 	local hex="1b 5b 3c $(printf '%s' "$2" | od -An -tx1 | tr -d ' \n') 3b 35 3b"
@@ -50,10 +54,12 @@ click() { # <pane> <button> <row>
 }
 
 # --- setup -------------------------------------------------------------------
+# bravo is working but changed state before alpha last replied: newest first
+# means alpha above bravo, whatever their colours.
 $TM new-session -d -s host -x 120 -y 30
-make_agent alpha idle
-make_agent bravo busy
-make_agent "with space" idle
+make_agent alpha idle 3000000
+make_agent bravo busy 2000000
+make_agent "with space" idle 1000000
 $TM new-session -d -s bar -x 120 -y 30
 $TM split-window -h -b -l 30 -d -t bar -e AGENT_SIDEBAR_TRACE="$TMP/trace" "$BIN"
 sleep 2
@@ -85,6 +91,38 @@ click "$PANE" 2 "$(row_of 'alpha')"; sleep 2
 grep -qx "alpha" "$XDG_STATE_HOME/agent-sidebar/parked" 2>/dev/null \
 	&& check 1 "right-click again un-parks" || check 0 "right-click again un-parks"
 
+# --- asking vs forgotten -----------------------------------------------------
+# A reported 'waiting' is purple and says asking; it must not be confused with
+# the amber an idle agent is promoted to after @agent_sidebar_idle_wait.
+make_agent asker waiting 3500000
+sleep 2
+# only the dot carries the state colour on a live row; the name keeps its own
+$TM capture-pane -p -e -t "$PANE" | grep -A0 'asker' | grep -q '38;2;215;166;255m ●' \
+	&& check 0 "a reported waiting agent has a purple dot" || check 1 "a reported waiting agent has a purple dot"
+sb --list | grep asker | grep -q asking \
+	&& check 0 "--list calls it asking" || check 1 "--list calls it asking"
+$TM kill-session -t asker 2>/dev/null; sleep 2
+
+# --- order -------------------------------------------------------------------
+[ "$(row_of alpha)" -lt "$(row_of bravo)" ] && [ "$(row_of bravo)" -lt "$(row_of 'with space')" ] \
+	&& check 0 "rows run newest change first, across colours" || check 1 "rows run newest change first, across colours"
+
+# --- freezing ----------------------------------------------------------------
+sb --freeze "$(pid_of alpha)"; sleep 2
+grep -qx "alpha" "$XDG_STATE_HOME/agent-sidebar/frozen" 2>/dev/null \
+	&& check 0 "--freeze lists the session" || check 1 "--freeze lists the session"
+[ "$(row_of alpha)" -gt "$(row_of 'with space')" ] \
+	&& check 0 "a frozen agent sits below the live ones" || check 1 "a frozen agent sits below the live ones"
+click "$PANE" 2 "$(row_of bravo)"; sleep 2   # park bravo: it must land under alpha
+[ "$(row_of bravo)" -gt "$(row_of alpha)" ] \
+	&& check 0 "and above a parked one" || check 1 "and above a parked one"
+click "$PANE" 2 "$(row_of bravo)"; sleep 1   # un-park bravo
+$TM capture-pane -p -e -t "$PANE" | grep -q '38;2;61;89;161m ● alpha' \
+	&& check 0 "a frozen row is deep blue" || check 1 "a frozen row is deep blue"
+sb --freeze "$(pid_of alpha)"; sleep 2
+grep -qx "alpha" "$XDG_STATE_HOME/agent-sidebar/frozen" 2>/dev/null \
+	&& check 1 "--freeze again un-freezes" || check 0 "--freeze again un-freezes"
+
 # --- split input -------------------------------------------------------------
 before=$(grep -c "click" "$TMP/trace" 2>/dev/null || echo 0)
 $TM send-keys -t "$PANE" -H 1b 5b 3c 32 3b 35; sleep 1
@@ -99,6 +137,16 @@ sb --rename-session "$p" "alpha renamed" >/dev/null 2>&1
 sleep 2
 $TM list-sessions -F '#{session_name}' | grep -qx "alpha renamed" \
 	&& check 0 "rename accepts a name with spaces" || check 1 "rename accepts a name with spaces"
+
+# A typed name reaches tmux exactly: '.' would read as session.pane, a quote or
+# ';' would end the command around it, '$' and '#' would be expanded.
+odd="v1.2 it's; \$HOME #x"
+$TM set -g @agent_sidebar_input "$odd"
+sb --rename-session "$(pid_of 'alpha renamed')" - >/dev/null 2>&1
+sleep 1
+$TM list-sessions -F '#{session_name}' | grep -qxF "$odd" \
+	&& check 0 "rename takes a typed name exactly" || check 1 "rename takes a typed name exactly"
+$TM rename-session -t "$($TM list-panes -a -F '#{pane_id} #{session_name}' | grep -F "$odd" | cut -d' ' -f1)" "alpha renamed"
 
 # a pid that matches no agent must be refused, never guessed at as a target
 sb --rename-session 999999 "must not happen" >/dev/null 2>&1
@@ -161,12 +209,16 @@ $TM list-sessions -F '#{session_name}' | grep -qx "fresh-2" \
 	&& check 0 "--new suffixes rather than colliding" || check 1 "--new suffixes rather than colliding"
 sb --new "$TMP/not-a-dir" >/dev/null 2>&1
 [ $? -eq 2 ] && check 0 "--new refuses a non-directory" || check 1 "--new refuses a non-directory"
+mkdir -p "$TMP/odd #dir"
+$TM set -g @agent_sidebar_input "$TMP/odd #dir"
+sb --new - >/dev/null 2>&1
+sleep 1
+[ "$($TM display-message -p -t '=odd #dir:' '#{pane_current_path}' 2>/dev/null)" = "$TMP/odd #dir" ] \
+	&& check 0 "--new takes a typed directory exactly" || check 1 "--new takes a typed directory exactly"
 
 # --- width -------------------------------------------------------------------
-# tmux hands a sidebar half of any change in window width; it must put itself
-# back, unless the border itself was dragged. tmux passes a pane's new size to
-# the application at most once a second, so each step is waited for, not slept
-# through: a fixed sleep landed on that boundary and lost the drag.
+# tmux shares any change in a window's width among its panes. The hook that
+# sidebar.tmux installs gives the sidebar its width back, whatever moved it.
 width_is() { # <cols>
 	for _ in {1..20}; do
 		[ "$($TM display-message -p -t "$PANE" '#{pane_width}')" = "$1" ] && return 0
@@ -174,23 +226,27 @@ width_is() { # <cols>
 	done
 	return 1
 }
-traced() { # <text>
-	for _ in {1..20}; do
-		grep -q "$1" "$TMP/trace" 2>/dev/null && return 0
-		sleep 0.25
-	done
-	return 1
-}
+$TM set-hook -gu 'window-layout-changed[1]'
+$TM resize-pane -t "$PANE" -x 25
+tm_env bash "$ROOT/sidebar.tmux"
+width_is 28 && check 0 "loading sidebar.tmux puts every open sidebar back to 28" \
+	|| check 1 "loading sidebar.tmux puts every open sidebar back to 28"
+sleep 2
 rows0=$(view | grep -c .)
 $TM resize-window -t bar -x 180
-width_is 30 && check 0 "holds its width when the window grows" \
+width_is 28 && check 0 "holds its width when the window grows" \
 	|| check 1 "holds its width when the window grows"
-$TM resize-pane -t "$PANE" -x 40                    # a drag of the border
-traced "dragged 30 -> 40" && check 0 "a border drag is not undone" \
-	|| check 1 "a border drag is not undone"
+$TM resize-pane -t "$PANE" -x 40
+width_is 28 && check 0 "a dragged border goes back" \
+	|| check 1 "a dragged border goes back"
+main=$($TM list-panes -t bar -F '#{pane_id} #{pane_current_command}' | awk '$2!="agent-sidebar"{print $1; exit}')
+$TM split-window -h -d -t "$main" "sleep 600"
+$TM kill-pane -t "$main"
+width_is 28 && check 0 "closing the pane beside it takes none of its width" \
+	|| check 1 "closing the pane beside it takes none of its width"
 $TM resize-window -t bar -x 120
-width_is 40 && check 0 "a dragged width is the one held" \
-	|| check 1 "a dragged width is the one held"
+width_is 28 && check 0 "holds its width when the window shrinks" \
+	|| check 1 "holds its width when the window shrinks"
 
 # --- fresh -------------------------------------------------------------------
 # tmux reflows a pane's text when its width changes, and once left a wrapped
@@ -210,8 +266,6 @@ sb --once --width 26 --rows 40 | grep -q "more" \
 # prefix+e is one control for every session: open everywhere, close everywhere,
 # and a window made later comes up the same way through the window-linked hook
 # that sidebar.tmux installs. Last, because it touches every window.
-ROOT="$(dirname "$BIN")"
-tm_env() { TMUX="$SOCKPATH,0,0" "$@"; }
 tm_env bash "$ROOT/sidebar.tmux"
 windows()      { $TM list-windows -a -F '#{window_id}' | wc -l; }
 with_sidebar() { $TM list-panes -a -F '#{window_id} #{pane_current_command}' | awk '$2=="agent-sidebar"{print $1}' | sort -u | wc -l; }

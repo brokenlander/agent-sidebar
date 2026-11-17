@@ -107,10 +107,14 @@ static void t_truncation(void)
 static void t_real_files(void)
 {
 	const char *home = getenv("HOME");
+	const char *cfg = getenv("CLAUDE_CONFIG_DIR");
 	char dir[512];
 	int seen = 0, parsed = 0;
 
-	snprintf(dir, sizeof dir, "%s/.claude/sessions", home ? home : ".");
+	if (cfg != NULL && *cfg != '\0')
+		snprintf(dir, sizeof dir, "%s/sessions", cfg);
+	else
+		snprintf(dir, sizeof dir, "%s/.claude/sessions", home ? home : ".");
 	DIR *d = opendir(dir);
 	if (d == NULL) {
 		printf("  SKIP  real session files (%s unreadable)\n", dir);
@@ -142,8 +146,12 @@ static void t_real_files(void)
 	}
 	closedir(d);
 
+	if (seen == 0) {
+		printf("  SKIP  real session files (none in %s)\n", dir);
+		return;
+	}
 	printf("  ....  %d/%d real session files parsed\n", parsed, seen);
-	check(seen > 0 && parsed == seen, "every real session file parses");
+	check(parsed == seen, "every real session file parses");
 }
 
 /* The producer writes this file; the reader must agree on every field it
@@ -191,12 +199,12 @@ static void t_render_widths(void)
 	/* narrow, normal, wide, and absurd - none may overflow a line */
 	int widths[] = { 1, 8, 20, 42, 200, 4000 };
 	for (size_t i = 0; i < sizeof widths / sizeof widths[0]; i++) {
-		render_build(&f, a, 3, widths[i], 50, 1000000, NULL, NULL, 0, NULL);
+		render_build(&f, a, 3, widths[i], 50, 1000000, NULL, NULL, 0, 0);
 		for (int r = 0; r < f.rows; r++)
 			check(strlen(f.line[r]) < LINE_MAX,
 			      "rendered line stays in bounds");
 	}
-	render_build(&f, a, 0, 30, 50, 1000000, NULL, NULL, 0, NULL);
+	render_build(&f, a, 0, 30, 50, 1000000, NULL, NULL, 0, 0);
 	check(f.rows > 0, "empty agent list still renders");
 }
 

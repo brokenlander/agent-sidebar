@@ -15,20 +15,19 @@ $(BIN): $(SRC) $(MAIN) src/json.h src/agents.h src/render.h
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(MAIN) $(LDFLAGS)
 
 # Tests run under ASan+UBSan against synthetic fixtures *and* the real
-# ~/.claude/sessions files, so malformed input on this machine is caught here.
-test: tests/test_json.c $(SRC)
+# session files, so malformed input on this machine is caught here. A failing
+# suite fails the target; only a missing interpreter is a skip.
+test: $(BIN) tests/test_json.c $(SRC)
 	$(CC) -std=c17 -g -O1 -Wall -Wextra -fsanitize=address,undefined \
 	      -fno-omit-frame-pointer -o /tmp/cs-test tests/test_json.c $(SRC)
 	@/tmp/cs-test
-	@command -v node >/dev/null && node tests/test_opencode_plugin.mjs || \
-		echo "  SKIP  opencode producer tests (node not found)"
+	@if command -v node >/dev/null; then node tests/test_opencode_plugin.mjs; \
+	else echo "  SKIP  opencode producer tests (node not found)"; fi
 	@bash tests/integration.sh
-	@command -v python3 >/dev/null && python3 tests/test_picker.py || \
-		echo "  SKIP  picker tests (python3 not found)"
-	@command -v python3 >/dev/null && python3 tests/test_menu.py || \
-		echo "  SKIP  menu tests (python3 not found)"
-	@command -v python3 >/dev/null && python3 tests/test_sections.py || \
-		echo "  SKIP  sections tests (python3 not found)"
+	@if command -v python3 >/dev/null; then \
+		python3 tests/test_picker.py && python3 tests/test_menu.py && \
+		python3 tests/test_sections.py; \
+	else echo "  SKIP  picker, menu and sections tests (python3 not found)"; fi
 
 sanitize: $(SRC) $(MAIN)
 	$(CC) -std=c17 -g -O1 -Wall -Wextra -fsanitize=address,undefined \

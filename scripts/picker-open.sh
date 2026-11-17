@@ -1,10 +1,6 @@
 #!/usr/bin/env sh
-# Opens the picker in a popup sized to its content.
-#
-# A fixed-height popup leaves the lower half empty whenever there are fewer
-# agents than rows, because fzf fills from the top under --reverse. The height
-# is computed from the agent count instead, and capped so a large fleet still
-# fits on screen.
+# Opens the picker in a popup, 95% of the client each way unless
+# @agent_sidebar_picker_width/height say otherwise.
 set -u
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$DIR/agent-sidebar"

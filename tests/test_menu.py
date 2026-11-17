@@ -80,6 +80,8 @@ try:
         return re.sub(r"\x1b\[[0-9;]*m", "", tm("capture-pane", "-p", "-t", pane))
     def parked():
         return os.path.exists("%s/state/agent-sidebar/parked" % tmp)
+    def frozen():
+        return os.path.exists("%s/state/agent-sidebar/frozen" % tmp)
 
     check(wait(lambda: tm("list-clients", "-F", "#{client_name}").strip() != "", 5),
           "a client attaches on a pty")
@@ -107,9 +109,19 @@ try:
     time.sleep(0.6); drain()
     os.write(fd, b"p")                                    # choose Park by key
     check(wait(parked, 3), "the menu survives the release and a choice works")
+
+    # the same again for Freeze; alpha is the only agent, so its row is the same
+    os.write(fd, b"\x1b[<1;3;%dM" % term_row); time.sleep(0.15)
+    os.write(fd, b"\x1b[<1;3;%dm" % term_row); time.sleep(0.6); drain()
+    os.write(fd, b"f")
+    check(wait(frozen, 3), "f on the menu freezes the agent")
 finally:
     tm("kill-server")
     shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        os.unlink("/tmp/tmux-%d/%s" % (os.getuid(), sock))
+    except OSError:
+        pass
 
 print()
 if fails:

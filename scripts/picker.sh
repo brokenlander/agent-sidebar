@@ -6,8 +6,8 @@
 # capture-pane preview and ctrl-x to kill - follows
 # craftzdog/tmux-claude-session-manager by Takuya Matsuyama, MIT licensed.
 # The implementation is independent: rows come from agent-sidebar's own loader,
-# which reads the per-pid state files directly (about 6ms) rather than shelling
-# out to the agent CLI (about 400ms).
+# which reads the per-pid state files directly rather than shelling out to the
+# agent CLI (about 400ms).
 set -u
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -21,8 +21,6 @@ for tool in fzf tmux; do
 	}
 done
 
-# Columns: 1 pid, 2 pane id, 3 state, 4 age, 5 session, 6 path.
-# The first two are hidden; they are what the actions key on.
 # A user's FZF_DEFAULT_OPTS is for interactive shell use and does not suit a
 # popup: --height makes fzf occupy a fraction of it and leave the rest blank,
 # and --border draws a second frame inside the popup's own. Start from nothing.
@@ -31,10 +29,10 @@ export FZF_DEFAULT_OPTS
 
 # fzf's own input is a search box, so a bare "k" would type rather than kill.
 # The actions use alt- mnemonics, with ctrl-x kept as an alias.
-hdr=$(printf '\033[38;5;110menter\033[0m jump   \033[38;5;110malt-k\033[0m kill   \033[38;5;110malt-p\033[0m park   \033[38;5;110malt-n\033[0m new   \033[38;5;110malt-v\033[0m preview   \033[38;5;110mesc\033[0m close')
+hdr=$(printf '\033[38;5;110menter\033[0m jump   \033[38;5;110malt-k\033[0m kill   \033[38;5;110malt-p\033[0m park   \033[38;5;110malt-f\033[0m freeze   \033[38;5;110malt-n\033[0m new   \033[38;5;110malt-v\033[0m preview   \033[38;5;110mesc\033[0m close')
 
-# Columns: 1 pid, 2 pane id, 3 state, 4 age, 5 session, 6 path.
-# The first two are hidden; they are what the actions key on.
+# Columns: 1 pid, 2 pane id, 3 state, 4 age, 5 session, 6 path, 7 kind.
+# Only 3 to 6 are shown; the actions key on the rest.
 sel=$("$BIN" --list | fzf --ansi --delimiter='\t' --with-nth=3..6 \
 	--reverse --cycle --no-sort --header-first --header="$hdr" \
 	--expect=alt-n \
@@ -45,6 +43,7 @@ sel=$("$BIN" --list | fzf --ansi --delimiter='\t' --with-nth=3..6 \
 	--bind="alt-k:execute-silent($BIN --kill {1})+reload(sleep 0.3; $BIN --list)" \
 	--bind="ctrl-x:execute-silent($BIN --kill {1})+reload(sleep 0.3; $BIN --list)" \
 	--bind="alt-p:execute-silent($BIN --park {1})+reload($BIN --list)" \
+	--bind="alt-f:execute-silent($BIN --freeze {1})+reload($BIN --list)" \
 	--bind="ctrl-p:execute-silent($BIN --park {1})+reload($BIN --list)")
 
 [ -n "$sel" ] || exit 0
@@ -65,8 +64,10 @@ if [ "$key" = "alt-n" ]; then
 	# is answered, so this script never exits, the popup never closes, and
 	# the open popup takes every key the answer would need: a blank popup
 	# that nothing gets out of.
-	tmux command-prompt -b -p "new $kind agent in:" -I "$dir" \
-		"run-shell \"$BIN --new '%%' $kind\""
+	# The answer reaches the binary through an option, never a shell.
+	tmux command-prompt -b -p "new $kind agent in:" \
+		-I "$(printf '%s' "$dir" | sed 's/#/##/g')" \
+		"set -g @agent_sidebar_input \"%%%\" ; run-shell \"'$BIN' --new - '$kind'\""
 	exit 0
 fi
 

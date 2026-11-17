@@ -16,7 +16,6 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/ioctl.h>
-#include <sys/time.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -36,13 +35,41 @@ static void on_stop(int sig)
 	g_stop = 1;
 }
 
-static long long now_ms(void)
+static long long mono_ms(void)
 {
-	struct timeval tv;
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
-	if (gettimeofday(&tv, NULL) != 0)
-		return 0;
-	return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+/* The state directory is shared (pm-board writes there), so only our own
+   files there are worth a refresh; the map's lock and temp file are not. */
+static int events_matter(int ifd, int state_wd)
+{
+	const char *map = strrchr(agents_map_path(), '/');
+	map = map != NULL ? map + 1 : agents_map_path();
+
+	_Alignas(struct inotify_event) char buf[4096];
+	int matter = 0;
+	ssize_t len;
+
+	while ((len = read(ifd, buf, sizeof buf)) > 0) {
+		for (char *p = buf; p < buf + len;) {
+			const struct inotify_event *ev = (const void *)p;
+			const char *name = ev->len > 0 ? ev->name : "";
+			size_t n = strlen(name);
+			if (ev->len == 0)
+				matter = 1;
+			else if (ev->wd != state_wd)
+				matter |= n > 5 && strcmp(name + n - 5, ".json") == 0;
+			else
+				matter |= strcmp(name, "parked") == 0 ||
+					  strcmp(name, "frozen") == 0 ||
+					  strcmp(name, map) == 0;
+			p += sizeof *ev + ev->len;
+		}
+	}
+	return matter;
 }
 
 static void term_size(int fd, int *cols, int *rows)
@@ -56,19 +83,6 @@ static void term_size(int fd, int *cols, int *rows)
 	}
 	*cols = 32;
 	*rows = 40;
-}
-
-static void producer_dir(char *dst, size_t cap)
-{
-	const char *xdg = getenv("XDG_STATE_HOME");
-	const char *home = getenv("HOME");
-
-	if (xdg != NULL && *xdg != '\0')
-		snprintf(dst, cap, "%s/agent-sidebar/agents", xdg);
-	else
-		snprintf(dst, cap, "%s/.local/state/agent-sidebar/agents",
-			 home != NULL ? home : ".");
-	mkdir(dst, 0755); /* so the watch can be established before a producer runs */
 }
 
 static void sessions_dir(char *dst, size_t cap)
@@ -94,8 +108,8 @@ static void emit(const char *s)
 	(void)r;
 }
 
-/* Registered with atexit and called from the signal path, so the pane is never
-   left in raw mode with mouse reporting on. */
+/* Registered with atexit, so however the loop ends the pane is never left in
+   raw mode with mouse reporting on. */
 static void tty_restore(void)
 {
 	emit("\033[?1006l\033[?1000l\033[?25h\033[?1049l");
@@ -149,53 +163,26 @@ static int run_tmux(char *const argv[])
 	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
-/* Capture all of stdout, newlines intact. */
-static int capture_all(char *const argv[], char *out, size_t cap);
-
-/* Capture all of stdout, newlines intact. */
-static int capture_all(char *const argv[], char *out, size_t cap)
+/* The pty is told every size tmux passes through, even one the width hook has already undone. */
+static void pane_size(int *cols, int *rows)
 {
-	int fds[2];
+	const char *pane = getenv("TMUX_PANE");
+	char out[32];
+	int c, r;
 
-	if (cap == 0 || pipe(fds) != 0)
-		return -1;
-	out[0] = '\0';
-
-	pid_t pid = fork();
-	if (pid < 0) {
-		close(fds[0]);
-		close(fds[1]);
-		return -1;
+	if (pane != NULL && *pane != '\0') {
+		char *argv[] = { (char *)"tmux", (char *)"display-message",
+				 (char *)"-p", (char *)"-t", (char *)pane,
+				 (char *)"#{pane_width} #{pane_height}", NULL };
+		if (tmux_capture(argv, out, sizeof out) == 0 &&
+		    sscanf(out, "%d %d", &c, &r) == 2 && c > 0 && r > 0) {
+			*cols = c;
+			*rows = r;
+			return;
+		}
 	}
-	if (pid == 0) {
-		close(fds[0]);
-		dup2(fds[1], STDOUT_FILENO);
-		close(fds[1]);
-		execvp("tmux", argv);
-		_exit(127);
-	}
-
-	close(fds[1]);
-	size_t got = 0;
-	while (got < cap - 1) {
-		ssize_t r = read(fds[0], out + got, cap - 1 - got);
-		if (r < 0 && errno == EINTR)
-			continue;
-		if (r <= 0)
-			break;
-		got += (size_t)r;
-	}
-	close(fds[0]);
-	out[got] = '\0';
-
-	int st = 0;
-	while (waitpid(pid, &st, 0) < 0)
-		if (errno != EINTR)
-			return -1;
-	return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+	term_size(STDOUT_FILENO, cols, rows);
 }
-
-
 
 /* Failures used to be swallowed by 2>/dev/null, which made a rejected rename
    look like a crash. Say so on the status line instead. */
@@ -206,81 +193,11 @@ static void notify(const char *msg)
 	run_tmux(argv);
 }
 
-/* Hold the sidebar's width across window resizes.
- *
- * tmux shares a change in window width equally between side-by-side panes. A
- * window last sized by a narrower client is resized when a wider one looks at
- * it, and the sidebar takes half of the difference: 28 columns opened in a
- * 184-column window come back as 61 in a 250-column one, past the point where
- * the rows gain a directory column. Only a change in the window's width is
- * undone. The window unchanged means the border was dragged, and the dragged
- * width is the one held from then on.
- */
-static int held_cols;     /* 0 until the pane is known to be in tmux */
-static int held_win_cols;
-
-static int window_width(void)
-{
-	const char *pane = getenv("TMUX_PANE");
-	char out[32];
-
-	if (pane == NULL || *pane == '\0')
-		return -1;
-	char *argv[] = { (char *)"tmux", (char *)"display-message",
-			 (char *)"-p", (char *)"-t", (char *)pane,
-			 (char *)"#{window_width}", NULL };
-	if (capture_all(argv, out, sizeof out) != 0)
-		return -1;
-	int w = atoi(out);
-	return w > 0 ? w : -1;
-}
-
-static void hold_width_init(int cols)
-{
-	int w = window_width();
-
-	if (w < 0)
-		return;
-	held_cols = cols;
-	held_win_cols = w;
-}
-
-static void hold_width(int cols)
-{
-	if (held_cols <= 0)
-		return;
-	int w = window_width();
-	if (w < 0)
-		return;
-	if (w == held_win_cols) {
-		/* a border drag: keep what was chosen */
-		if (cols != held_cols)
-			trace("hold width: dragged %d -> %d", held_cols, cols);
-		held_cols = cols;
-		return;
-	}
-	held_win_cols = w;
-	if (cols == held_cols)
-		return;
-
-	char want[16];
-	snprintf(want, sizeof want, "%d", held_cols);
-	char *argv[] = { (char *)"tmux", (char *)"resize-pane",
-			 (char *)"-t", (char *)getenv("TMUX_PANE"),
-			 (char *)"-x", want, NULL };
-	int rc = run_tmux(argv);
-	trace("hold width: window %d, pane %d -> %d, rc=%d", w, cols,
-	      held_cols, rc);
-}
-
-
-/* Move the client that is looking at this sidebar to the clicked agent. The
-   client is resolved from our own session rather than left to tmux's notion of
-   "current", which is ambiguous with several clients attached. */
-/* The client viewing this sidebar. Keyed on our own pane id, never the session
-   name - a rename left the cached name pointing at nothing, the client came back
-   empty, and the switch fell through to whichever client tmux considered
-   current, usually a different terminal. One ~4ms call. */
+/* The client viewing this sidebar, rather than tmux's notion of "current",
+   which is ambiguous with several clients attached. Keyed on our own pane id,
+   never the session name - a rename left the cached name pointing at nothing,
+   the client came back empty, and the switch fell through to whichever client
+   tmux considered current, usually a different terminal. One ~4ms call. */
 static void resolve_client(char *client, size_t cap)
 {
 	client[0] = '\0';
@@ -292,7 +209,7 @@ static void resolve_client(char *client, size_t cap)
 	char *lc[] = { (char *)"tmux", (char *)"list-clients",
 		       (char *)"-t", (char *)self_pane, (char *)"-F",
 		       (char *)"#{client_activity} #{client_name}", NULL };
-	if (capture_all(lc, list, sizeof list) != 0)
+	if (tmux_capture(lc, list, sizeof list) != 0)
 		return;
 
 	/* Two terminals can view one session. Prefer the most recently used -
@@ -313,54 +230,22 @@ static void resolve_client(char *client, size_t cap)
 	}
 }
 
-/* Switch the sidebar's client to a plain session - no agent pane to select. */
-static void jump_to_session(const char *sess)
+/* By id only ("$3", or "%27" which selects its window too): tmux reads the
+   name "v1.2" as session v1, pane 2. */
+static void jump_client(const char *target)
 {
-	if (sess == NULL || sess[0] == '\0')
-		return;
 	char client[128];
+
+	if (target == NULL || target[0] == '\0')
+		return;
 	resolve_client(client, sizeof client);
 
 	char *with[] = { (char *)"tmux", (char *)"switch-client", (char *)"-c",
-			 client, (char *)"-t", (char *)sess, NULL };
+			 client, (char *)"-t", (char *)target, NULL };
 	char *no[] = { (char *)"tmux", (char *)"switch-client", (char *)"-t",
-		       (char *)sess, NULL };
+		       (char *)target, NULL };
 	int rc = run_tmux(client[0] != '\0' ? with : no);
-	trace("jump session=%s client=%s rc=%d", sess, client, rc);
-}
-
-static void jump_to(const agent *a)
-{
-	char client[128];
-
-	if (a->pane_id[0] == '\0')
-		return;
-
-	resolve_client(client, sizeof client);
-
-	char *with_client[] = {
-		(char *)"tmux",
-		(char *)"switch-client", (char *)"-c", client,
-		(char *)"-t", (char *)a->sess, (char *)";",
-		(char *)"select-window", (char *)"-t", (char *)a->pane_id,
-		(char *)";",
-		(char *)"select-pane", (char *)"-t", (char *)a->pane_id,
-		NULL,
-	};
-	char *no_client[] = {
-		(char *)"tmux",
-		(char *)"switch-client", (char *)"-t", (char *)a->sess,
-		(char *)";",
-		(char *)"select-window", (char *)"-t", (char *)a->pane_id,
-		(char *)";",
-		(char *)"select-pane", (char *)"-t", (char *)a->pane_id,
-		NULL,
-	};
-
-	int rc = run_tmux(client[0] != '\0' ? with_client : no_client);
-
-	trace("jump sess=%s pane=%s client=%s rc=%d", a->sess, a->pane_id,
-	      client, rc);
+	trace("jump target=%s client=%s rc=%d", target, client, rc);
 }
 
 /* -M (let the menu handle mouse clicks) landed in tmux 3.5; before that the
@@ -377,7 +262,7 @@ static int menu_mouse_ok(void)
 	cached = 0;
 	char *argv[] = { (char *)"tmux", (char *)"display-message",
 			 (char *)"-p", (char *)"#{version}", NULL };
-	if (capture_all(argv, out, sizeof out) == 0) {
+	if (tmux_capture(argv, out, sizeof out) == 0) {
 		int maj = 0, min = 0;
 		if (sscanf(out, "%d.%d", &maj, &min) == 2)
 			cached = maj > 3 || (maj == 3 && min >= 5);
@@ -385,57 +270,122 @@ static int menu_mouse_ok(void)
 	return cached;
 }
 
-/* tmux renders the menu, handles its keys and runs the chosen command, so the
-   sidebar needs no menu widget of its own. */
-static void open_menu(const agent *a)
+/* tmux expands $NAME and ~ in double quotes and '#' in formats (prompts,
+   titles, menu items, session names). -1 rather than truncate a quote. */
+static int fmt_escape(char *dst, size_t cap, const char *src)
 {
-	const char *self = getenv("AGENT_SIDEBAR_BIN");
-	char selfbuf[512];
+	size_t o = 0;
 
-	if (self == NULL) {
-		ssize_t r = readlink("/proc/self/exe", selfbuf,
-				     sizeof selfbuf - 1);
-		if (r <= 0)
-			return;
-		selfbuf[r] = '\0';
-		self = selfbuf;
+	for (; *src != '\0'; src++) {
+		if (o + 3 > cap)
+			return -1;
+		if (*src == '#')
+			dst[o++] = '#';
+		dst[o++] = *src;
 	}
+	dst[o] = '\0';
+	return 0;
+}
 
-	char title[128], jump[640], park[640], rename[900], killc[900];
-	char newc[900], pid[32];
-	snprintf(pid, sizeof pid, "%lld", a->pid);
-	snprintf(title, sizeof title, " #[align=centre]%s ", a->sess);
-	snprintf(jump, sizeof jump, "run-shell '%s --jump %s'", self, pid);
-	snprintf(park, sizeof park, "run-shell '%s --park %s'", self, pid);
-	/* start another agent in the same directory as this one */
-	const char *kindlabel = a->agent[0] != '\0' ? a->agent : "claude";
-	snprintf(newc, sizeof newc,
-		 "command-prompt -p 'new %s agent in:' -I '%s' "
-		 "\"run-shell '%s --new \\\"%%%%\\\" %s'\"",
-		 kindlabel, a->cwd, self, kindlabel);
+static int tm_quote(char *dst, size_t cap, const char *src)
+{
+	size_t o = 0;
 
-	/* tmux asks for confirmation itself, so there is no dialog to build */
-	snprintf(killc, sizeof killc,
-		 "confirm-before -p 'kill %s? (y/n)' "
-		 "\"run-shell '%s --kill %s'\"",
-		 a->sess, self, pid);
+	if (cap < 3)
+		return -1;
+	dst[o++] = '"';
+	for (; *src != '\0'; src++) {
+		if (o + 4 > cap)
+			return -1;
+		if (strchr("\\\"$~", *src) != NULL)
+			dst[o++] = '\\';
+		dst[o++] = *src;
+	}
+	dst[o++] = '"';
+	dst[o] = '\0';
+	return 0;
+}
 
-	/* the typed name is the only thing a shell sees, and it stays quoted.
-	   No -I: pre-filling the current name means clearing it before you can
-	   type, and renaming to a variation of the old name is the rare case.
-	   The prompt carries the context instead, so nothing is lost. Enter on
-	   an empty field is refused by --rename-session, not acted on. */
-	snprintf(rename, sizeof rename,
-		 "command-prompt -p 'rename %s to:' "
-		 "{ run-shell '%s --rename-session %s \"%%%%\"' }",
-		 a->sess, self, pid);
+static int sh_quote(char *dst, size_t cap, const char *src)
+{
+	size_t o = 0;
 
-	/* -O keeps the menu up when a click lands off an item instead of closing
-	   it, and -M lets a click choose one. A process-opened menu is marked
-	   "no mouse" by tmux, so without these the button release that opened it
-	   would close it again - see the release-triggered path in
-	   act_on_click. -M needs tmux 3.5. */
-	char *argv[32];
+	if (cap < 3)
+		return -1;
+	dst[o++] = '\'';
+	for (; *src != '\0'; src++) {
+		if (o + 6 > cap)
+			return -1;
+		if (*src == '\'') {
+			memcpy(dst + o, "'\\''", 4);
+			o += 4;
+		} else {
+			dst[o++] = *src;
+		}
+	}
+	dst[o++] = '\'';
+	dst[o] = '\0';
+	return 0;
+}
+
+/* tm_quote(fmt_escape(src)): a format argument inside a command string. */
+static int tm_format(char *dst, size_t cap, const char *src)
+{
+	char esc[1024];
+
+	return fmt_escape(esc, sizeof esc, src) == 0 ? tm_quote(dst, cap, esc) : -1;
+}
+
+/* The binary's own path, for menu items that run it. */
+static const char *self_exe(void)
+{
+	static char buf[512];
+	const char *env = getenv("AGENT_SIDEBAR_BIN");
+
+	if (env != NULL)
+		return env;
+	if (buf[0] == '\0') {
+		ssize_t r = readlink("/proc/self/exe", buf, sizeof buf - 1);
+		if (r <= 0)
+			return NULL;
+		buf[r] = '\0';
+	}
+	return buf;
+}
+
+/* `run-shell "'<self>' <args>"`; args must already be safe for sh. */
+static int run_self(char *dst, size_t cap, const char *args)
+{
+	const char *self = self_exe();
+	char q[1100], sh[1400];
+
+	if (self == NULL || sh_quote(q, sizeof q, self) != 0)
+		return -1;
+	if (snprintf(sh, sizeof sh, "%s %s", q, args) >= (int)sizeof sh)
+		return -1;
+	if (snprintf(dst, cap, "run-shell ") >= (int)cap)
+		return -1;
+	return tm_format(dst + 10, cap - 10, sh);
+}
+
+/* "%%%" is the typed text with quotes and '$' escaped: it reaches the option
+   verbatim and no shell ever sees it (take_input reads it back). */
+static int prompt_self(char *dst, size_t cap, const char *args)
+{
+	char run[1700];
+
+	if (run_self(run, sizeof run, args) != 0)
+		return -1;
+	return snprintf(dst, cap, "set -g @agent_sidebar_input \"%%%%%%\" ; %s",
+			run) >= (int)cap ? -1 : 0;
+}
+
+/* -O keeps a menu up when a click lands off an item instead of closing it,
+   and -M lets a click choose one. A process-opened menu is marked "no mouse"
+   by tmux, so without these the button release that opened it would close it
+   again. -M needs tmux 3.5. */
+static int menu_head(char **argv, const char *title)
+{
 	int k = 0;
 	argv[k++] = (char *)"tmux";
 	argv[k++] = (char *)"display-menu";
@@ -443,14 +393,104 @@ static void open_menu(const agent *a)
 	if (menu_mouse_ok())
 		argv[k++] = (char *)"-M";
 	argv[k++] = (char *)"-T";
-	argv[k++] = title;
+	argv[k++] = (char *)title;
 	argv[k++] = (char *)"-x";
 	argv[k++] = (char *)"P";
 	argv[k++] = (char *)"-y";
 	argv[k++] = (char *)"P";
+	return k;
+}
+
+/* display-menu blocks while the menu is up when called from inside the same
+   client, so it must not be waited on. Double-fork rather than ignoring
+   SIGCHLD: that disposition is process-wide and permanent, and it silently
+   broke every later waitpid in run_tmux. */
+static void spawn_menu(char *const argv[])
+{
+	pid_t child = fork();
+	if (child == 0) {
+		if (fork() == 0) {
+			execvp("tmux", argv);
+			_exit(127);
+		}
+		_exit(0); /* orphan it; init reaps the grandchild */
+	}
+	if (child > 0) {
+		int st;
+		while (waitpid(child, &st, 0) < 0 && errno == EINTR)
+			; /* the intermediate child exits at once */
+	}
+}
+
+/* tmux renders the menu, handles its keys and runs the chosen command, so the
+   sidebar needs no menu widget of its own. */
+static void open_menu(const agent *a)
+{
+	char title[200], esc[140], args[160], text[600], cmd[4000];
+	char jump[1800], park[1800], freeze[1800], rename[6000];
+	char newc[8000], killc[4000], kind[64], qkind[80];
+	int bad = 0;
+
+	snprintf(kind, sizeof kind, "%s", a->agent[0] != '\0' ? a->agent : "claude");
+	bad |= sh_quote(qkind, sizeof qkind, kind);
+	bad |= fmt_escape(esc, sizeof esc, a->sess);
+	snprintf(title, sizeof title, "#[align=centre] %s ", esc);
+
+	snprintf(args, sizeof args, "--jump %lld", a->pid);
+	bad |= run_self(jump, sizeof jump, args);
+	snprintf(args, sizeof args, "--park %lld", a->pid);
+	bad |= run_self(park, sizeof park, args);
+	snprintf(args, sizeof args, "--freeze %lld", a->pid);
+	bad |= run_self(freeze, sizeof freeze, args);
+
+	/* start another agent of the same kind, in the same directory */
+	char qp[700], qi[1100], qc[3000];
+	snprintf(args, sizeof args, "--new - %s", qkind);
+	bad |= prompt_self(cmd, sizeof cmd, args);
+	snprintf(text, sizeof text, "new %s agent in:", kind);
+	bad |= tm_format(qp, sizeof qp, text);
+	bad |= tm_format(qi, sizeof qi, a->cwd);
+	bad |= tm_quote(qc, sizeof qc, cmd);
+	if (snprintf(newc, sizeof newc, "command-prompt -p %s -I %s %s", qp, qi,
+		     qc) >= (int)sizeof newc)
+		bad = -1;
+
+	/* tmux asks for confirmation itself, so there is no dialog to build */
+	snprintf(args, sizeof args, "--kill %lld", a->pid);
+	bad |= run_self(cmd, sizeof cmd, args);
+	snprintf(text, sizeof text, "kill %s? (y/n)", a->sess);
+	bad |= tm_format(qp, sizeof qp, text);
+	bad |= tm_quote(qc, sizeof qc, cmd);
+	if (snprintf(killc, sizeof killc, "confirm-before -p %s %s", qp, qc) >=
+	    (int)sizeof killc)
+		bad = -1;
+
+	/* No -I: pre-filling the current name means clearing it before you can
+	   type, and renaming to a variation of the old name is the rare case.
+	   The prompt carries the context instead. Enter on an empty field is
+	   refused by --rename-session, not acted on. */
+	snprintf(args, sizeof args, "--rename-session %lld -", a->pid);
+	bad |= prompt_self(cmd, sizeof cmd, args);
+	snprintf(text, sizeof text, "rename %s to:", a->sess);
+	bad |= tm_format(qp, sizeof qp, text);
+	bad |= tm_quote(qc, sizeof qc, cmd);
+	if (snprintf(rename, sizeof rename, "command-prompt -p %s %s", qp, qc) >=
+	    (int)sizeof rename)
+		bad = -1;
+
+	if (bad != 0) {
+		notify("agent-sidebar: that name is too long for a menu");
+		return;
+	}
+
+	char *argv[40];
+	int k = menu_head(argv, title);
 	argv[k++] = (char *)"Jump to";
 	argv[k++] = (char *)"j";
 	argv[k++] = jump;
+	argv[k++] = (char *)(a->frozen ? "Un-freeze" : "Freeze");
+	argv[k++] = (char *)"f";
+	argv[k++] = freeze;
 	argv[k++] = (char *)(a->parked ? "Un-park" : "Park");
 	argv[k++] = (char *)"p";
 	argv[k++] = park;
@@ -468,53 +508,31 @@ static void open_menu(const agent *a)
 	argv[k++] = killc;
 	argv[k++] = NULL;
 
-	trace("menu for sess=%s pid=%s", a->sess, pid);
-
-	/* display-menu blocks while the menu is up when called from inside the
-	   same client, so it must not be waited on. Double-fork rather than
-	   ignoring SIGCHLD: that disposition is process-wide and permanent, and
-	   it silently broke every later waitpid in run_tmux. */
-	pid_t child = fork();
-	if (child == 0) {
-		pid_t grandchild = fork();
-		if (grandchild == 0) {
-			execvp("tmux", argv);
-			_exit(127);
-		}
-		_exit(0); /* orphan it; init reaps the grandchild */
-	}
-	if (child > 0) {
-		int st;
-		while (waitpid(child, &st, 0) < 0 && errno == EINTR)
-			; /* the intermediate child exits at once */
-	}
+	trace("menu for sess=%s pid=%lld", a->sess, a->pid);
+	spawn_menu(argv);
 }
 
-/* Middle-click on a non-agent session row: a small menu to jump or kill it.
-   Pure tmux commands, so no binary action is needed; -M -O keep it from
-   closing on the button release (see open_menu). */
-static void open_session_menu(const char *sess)
+/* Middle-click on a non-agent session row: jump to it or kill it, by id. */
+static void open_session_menu(const char *name, const char *id)
 {
-	char title[128], jump[192], killc[320];
-	snprintf(title, sizeof title, " #[align=centre]%s ", sess);
-	snprintf(jump, sizeof jump, "switch-client -t '%s'", sess);
-	snprintf(killc, sizeof killc,
-		 "confirm-before -p 'kill %s? (y/n)' \"kill-session -t '%s'\"",
-		 sess, sess);
+	char title[200], esc[140], text[200], qp[600], qid[40];
+	char jump[64], inner[96], qin[200], killc[900];
+	int bad = 0;
+
+	bad |= fmt_escape(esc, sizeof esc, name);
+	snprintf(title, sizeof title, "#[align=centre] %s ", esc);
+	bad |= tm_quote(qid, sizeof qid, id);
+	snprintf(jump, sizeof jump, "switch-client -t %s", qid);
+	snprintf(inner, sizeof inner, "kill-session -t %s", qid);
+	bad |= tm_quote(qin, sizeof qin, inner);
+	snprintf(text, sizeof text, "kill %s? (y/n)", name);
+	bad |= tm_format(qp, sizeof qp, text);
+	snprintf(killc, sizeof killc, "confirm-before -p %s %s", qp, qin);
+	if (bad != 0)
+		return;
 
 	char *argv[16];
-	int k = 0;
-	argv[k++] = (char *)"tmux";
-	argv[k++] = (char *)"display-menu";
-	argv[k++] = (char *)"-O";
-	if (menu_mouse_ok())
-		argv[k++] = (char *)"-M";
-	argv[k++] = (char *)"-T";
-	argv[k++] = title;
-	argv[k++] = (char *)"-x";
-	argv[k++] = (char *)"P";
-	argv[k++] = (char *)"-y";
-	argv[k++] = (char *)"P";
+	int k = menu_head(argv, title);
 	argv[k++] = (char *)"Jump to";
 	argv[k++] = (char *)"j";
 	argv[k++] = jump;
@@ -522,21 +540,46 @@ static void open_session_menu(const char *sess)
 	argv[k++] = (char *)"k";
 	argv[k++] = killc;
 	argv[k++] = NULL;
+	spawn_menu(argv);
+}
 
-	pid_t child = fork();
-	if (child == 0) {
-		pid_t grandchild = fork();
-		if (grandchild == 0) {
-			execvp("tmux", argv);
-			_exit(127);
+static char g_legend[1024];
+
+/* @agent_sidebar_legend ("key label;..."; ';' so a key can be '|') as a menu
+   that only shows them. */
+static void open_keys_menu(void)
+{
+	char *argv[200];
+	char items[2048];
+	size_t o = 0;
+	int k = menu_head(argv, "#[align=centre] #{prefix} + key ");
+
+	for (const char *p = g_legend; *p != '\0'; p += *p == ';') {
+		size_t len = strcspn(p, ";");
+		const char *sp = memchr(p, ' ', len);
+		const char *label = sp != NULL ? sp + 1 : p;
+		size_t klen = sp != NULL ? (size_t)(sp - p) : 0;
+		size_t llen = len - (size_t)(label - p);
+
+		if (k + 4 > (int)(sizeof argv / sizeof argv[0]) ||
+		    o + klen + 2 * llen + 2 > sizeof items)
+			break;
+		argv[k++] = items + o;
+		for (size_t i = 0; i < llen; i++) {
+			if (label[i] == '#') /* a label is a format */
+				items[o++] = '#';
+			items[o++] = label[i];
 		}
-		_exit(0);
+		items[o++] = '\0';
+		argv[k++] = memcpy(items + o, p, klen);
+		o += klen;
+		items[o++] = '\0';
+		argv[k++] = (char *)"";
+		p += len;
 	}
-	if (child > 0) {
-		int st;
-		while (waitpid(child, &st, 0) < 0 && errno == EINTR)
-			;
-	}
+	argv[k++] = NULL;
+	trace("shortcuts menu");
+	spawn_menu(argv);
 }
 
 static void trace(const char *fmt, ...)
@@ -582,12 +625,18 @@ static void act_on_click(const frame *f, const agent *a, int n, int button,
 	int idx = row - 1;
 	if (idx < 0 || idx >= f->rows)
 		return;
+	if (idx == f->keys_row) {
+		trace("click button=%d row=%d -> shortcuts", which_button, row);
+		if (which_button != 2)
+			open_keys_menu();
+		return;
+	}
 	int which = f->row_agent[idx];
 	if (which >= 0 && which < n) {
 		trace("click button=%d row=%d -> agent %d", which_button, row,
 		      which);
 		if (which_button == 0)
-			jump_to(&a[which]);
+			jump_client(a[which].pane_id);
 		else if (which_button == 1)
 			open_menu(&a[which]);
 		else
@@ -595,13 +644,13 @@ static void act_on_click(const frame *f, const agent *a, int n, int button,
 		return;
 	}
 
-	if (f->row_session[idx][0] != '\0') { /* a non-agent session row */
+	if (f->row_sid[idx][0] != '\0') { /* a non-agent session row */
 		trace("click button=%d row=%d -> session %s", which_button, row,
 		      f->row_session[idx]);
 		if (which_button == 0)
-			jump_to_session(f->row_session[idx]);
+			jump_client(f->row_sid[idx]);
 		else if (which_button == 1)
-			open_session_menu(f->row_session[idx]);
+			open_session_menu(f->row_session[idx], f->row_sid[idx]);
 	}
 }
 
@@ -662,8 +711,6 @@ static void handle_input(const frame *f, const agent *a, int n)
 		in_len = 0;
 }
 
-/* Rewrites the park entry when a session is renamed, so a parked agent does
-   not silently un-park because its key changed. */
 /* Actions run as a separate short-lived process, so they reload state. */
 static agent *agent_by_pid(long long pid)
 {
@@ -676,14 +723,20 @@ static agent *agent_by_pid(long long pid)
 	return NULL;
 }
 
-static void park_rename(const char *old, const char *new_name)
+/* Rewrites the park and freeze entries when a session is renamed, so a
+   listed agent does not silently drop off because its key changed. */
+static void lists_rename(const char *old, const char *new_name)
 {
-	/* Consult the park list itself: the session may have no running agent
-	   yet still be parked, and a live-agent lookup would miss it. */
-	if (!agents_park_has(old))
-		return;
-	agents_park_toggle(old);       /* drop the stale key */
-	agents_park_toggle(new_name);  /* add the new one */
+	/* Consult the lists themselves: the session may have no running agent
+	   yet still be listed, and a live-agent lookup would miss it. */
+	if (agents_park_has(old)) {
+		agents_park_toggle(old);       /* drop the stale key */
+		agents_park_toggle(new_name);  /* add the new one */
+	}
+	if (agents_freeze_has(old)) {
+		agents_freeze_toggle(old);
+		agents_freeze_toggle(new_name);
+	}
 }
 
 /* Re-exec when our own binary is replaced.
@@ -757,185 +810,171 @@ static void self_reexec_if_replaced(void)
 
 static void usage(void)
 {
-	fputs("agent-sidebar - live status of every Claude Code agent\n\n"
+	fputs("agent-sidebar - live status of every coding agent\n\n"
 	      "  agent-sidebar            run in a tmux pane (live)\n"
 	      "  agent-sidebar --once     print one frame and exit\n"
 	      "  agent-sidebar --width N  force a width (with --once)\n"
-	      "  agent-sidebar --rows N   force a height (with --once)\n",
+	      "  agent-sidebar --rows N   force a height (with --once)\n"
+	      "  agent-sidebar --list     one agent per line, for the picker\n"
+	      "  agent-sidebar --debug    dump the resolved rows\n",
 	      stderr);
 }
 
-static char g_legend[512];
+/* What prompt_self's prompt saved, cleared once read. */
+static void take_input(char *dst, size_t cap)
+{
+	char *get[] = { (char *)"tmux", (char *)"show-option", (char *)"-gqv",
+			(char *)"@agent_sidebar_input", NULL };
+	char *unset[] = { (char *)"tmux", (char *)"set-option", (char *)"-gu",
+			  (char *)"@agent_sidebar_input", NULL };
+
+	if (tmux_capture(get, dst, cap) != 0)
+		dst[0] = '\0';
+	dst[strcspn(dst, "\n")] = '\0';
+	run_tmux(unset);
+}
+
+/* A new session named for the directory, running the row's kind of agent
+   (@agent_sidebar_command_<kind> overrides), and the asking client moved to it. */
+static int new_agent(const char *where, const char *kind)
+{
+	char given[512], dir[512];
+
+	if (strcmp(where, "-") == 0)
+		take_input(given, sizeof given);
+	else
+		snprintf(given, sizeof given, "%s", where);
+
+	/* --list and the menu offer paths with $HOME collapsed */
+	if (given[0] == '~' && (given[1] == '/' || given[1] == '\0')) {
+		const char *home = getenv("HOME");
+		snprintf(dir, sizeof dir, "%s%s", home ? home : "", given + 1);
+	} else {
+		snprintf(dir, sizeof dir, "%s", given);
+	}
+
+	struct stat st;
+	if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+		notify("agent-sidebar: not a directory");
+		return 2;
+	}
+	if (kind[0] == '\0')
+		kind = "claude";
+
+	char optname[96], cmd[256] = "";
+	snprintf(optname, sizeof optname, "@agent_sidebar_command_%s", kind);
+	char *opt[] = { (char *)"tmux", (char *)"show-option", (char *)"-gqv",
+			optname, NULL };
+	tmux_capture(opt, cmd, sizeof cmd);
+	cmd[strcspn(cmd, "\n")] = '\0';
+	if (cmd[0] == '\0') {
+		/* the older single-command option still wins if set */
+		char *legacy[] = { (char *)"tmux", (char *)"show-option",
+				   (char *)"-gqv",
+				   (char *)"@agent_sidebar_new_command", NULL };
+		tmux_capture(legacy, cmd, sizeof cmd);
+		cmd[strcspn(cmd, "\n")] = '\0';
+	}
+	if (cmd[0] == '\0')
+		snprintf(cmd, sizeof cmd, "%s", kind);
+
+	/* name after the directory, suffixed until it is free */
+	const char *base = strrchr(dir, '/');
+	base = (base != NULL && base[1] != '\0') ? base + 1 : dir;
+	char name[128], exact[132], esc[260], id[32];
+	snprintf(name, sizeof name, "%.*s", (int)(sizeof name - 5), base);
+	for (int i = 2; i < 100; i++) {
+		snprintf(exact, sizeof exact, "=%s", name);
+		char *has[] = { (char *)"tmux", (char *)"has-session",
+				(char *)"-t", exact, NULL };
+		if (run_tmux(has) != 0)
+			break;
+		snprintf(name, sizeof name, "%.*s-%d", (int)(sizeof name - 8),
+			 base, i);
+	}
+	fmt_escape(esc, sizeof esc, name);
+
+	char *mk[] = { (char *)"tmux", (char *)"new-session", (char *)"-d",
+		       (char *)"-P", (char *)"-F", (char *)"#{session_id}",
+		       (char *)"-s", esc, (char *)"-c", dir, cmd, NULL };
+	if (tmux_capture(mk, id, sizeof id) != 0) {
+		notify("agent-sidebar: could not create the session");
+		return 1;
+	}
+	id[strcspn(id, "\n")] = '\0';
+	jump_client(id);
+	trace("new session=%s dir=%s kind=%s cmd=%s", name, dir, kind, cmd);
+	return 0;
+}
+
 static char g_exclude[256];
 static int g_show_sessions;
 
-/* Read the two display options once. They change only on a config reload,
-   which does not reach a running process, so there is nothing to poll. */
+/* Read the options once, in one tmux call. They change only on a config
+   reload, which does not reach a running process, so there is nothing to
+   poll. */
 static void read_config(void)
 {
-	char buf[512];
-	char *lg[] = { (char *)"tmux", (char *)"show-option", (char *)"-gqv",
-		       (char *)"@agent_sidebar_legend", NULL };
-	if (capture_all(lg, buf, sizeof buf) == 0) {
-		char *nl = strchr(buf, '\n');
-		if (nl != NULL)
-			*nl = '\0';
-		snprintf(g_legend, sizeof g_legend, "%s", buf);
+	char buf[1024];
+	char *argv[] = { (char *)"tmux", (char *)"display-message", (char *)"-p",
+			 (char *)"#{@agent_sidebar_legend}\t"
+				 "#{@agent_sidebar_sessions}\t"
+				 "#{@agent_sidebar_exclude}\t"
+				 "#{@agent_sidebar_idle_wait}",
+			 NULL };
+	char *f[4] = { buf, NULL, NULL, NULL };
+
+	if (tmux_capture(argv, buf, sizeof buf) != 0)
+		return;
+	buf[strcspn(buf, "\n")] = '\0';
+	for (int i = 1; i < 4; i++) {
+		f[i] = strchr(f[i - 1], '\t');
+		if (f[i] == NULL)
+			return;
+		*f[i]++ = '\0';
 	}
-	char *so[] = { (char *)"tmux", (char *)"show-option", (char *)"-gqv",
-		       (char *)"@agent_sidebar_sessions", NULL };
-	if (capture_all(so, buf, sizeof buf) == 0) {
-		char c = buf[0];
-		g_show_sessions = c == 'o' || c == '1' || c == 't' || c == 'y';
-	}
-	char *ex[] = { (char *)"tmux", (char *)"show-option", (char *)"-gqv",
-		       (char *)"@agent_sidebar_exclude", NULL };
-	if (capture_all(ex, g_exclude, sizeof g_exclude) == 0) {
-		char *nl = strchr(g_exclude, '\n');
-		if (nl != NULL)
-			*nl = '\0';
-	}
+	snprintf(g_legend, sizeof g_legend, "%s", f[0]);
+	g_show_sessions = strcmp(f[1], "on") == 0 || strcmp(f[1], "1") == 0 ||
+			  strcmp(f[1], "yes") == 0 || strcmp(f[1], "true") == 0;
+	snprintf(g_exclude, sizeof g_exclude, "%s", f[2]);
+
 	/* Minutes of idleness after which an agent reads as wanting you. 0 turns
 	   the promotion off and leaves idle permanently green. */
-	char *iw[] = { (char *)"tmux", (char *)"show-option", (char *)"-gqv",
-		       (char *)"@agent_sidebar_idle_wait", NULL };
-	if (capture_all(iw, buf, sizeof buf) == 0 && buf[0] != '\0') {
-		char *end = NULL;
-		long mins = strtol(buf, &end, 10);
-		if (end != buf && mins >= 0)
-			agents_set_idle_wait((long long)mins * 60);
-	}
+	char *end = NULL;
+	long mins = strtol(f[3], &end, 10);
+	if (end != f[3] && mins >= 0)
+		agents_set_idle_wait((long long)mins * 60);
 }
 
-int main(int argc, char **argv)
+/* The menu actions take a pid, never a session name: digits need no quoting.
+   A typed directory or name arrives as "-", meaning take_input. */
+static int action(int argc, char **argv)
 {
-	static agent agents[AGENT_MAX];
-	static frame cur, prev;
-	int once = 0;
-	int force_width = 0;
-	int force_rows = 0;
-	int debug = 0;
-	int list = 0;
+	const char *verb = argv[1];
+	agent *found = argc >= 3 ? agent_by_pid(atoll(argv[2])) : NULL;
 
-	/* Actions, invoked by tmux menu items rather than by a person. */
-	/* These take a pid, not a session name. A pid is always digits, so
-	   nothing needs quoting when tmux menu items invoke them - a session
-	   called "PR-3 BYO" broke every name-keyed action. */
-	if (argc >= 3 && strcmp(argv[1], "--park") == 0) {
-		agent *found = agent_by_pid(atoll(argv[2]));
+	if (strcmp(verb, "--panes") == 0) {
+		agents_refresh_panes();
+		return 0;
+	}
+	if (argc < 3)
+		return -1;
+	if (strcmp(verb, "--park") == 0) {
 		if (found != NULL)
 			agents_park_toggle(found->sess);
 		return 0;
 	}
-	if (argc >= 3 && strcmp(argv[1], "--new") == 0) {
-		char dir[512];
-
-		/* --list prints paths with $HOME collapsed, so whatever calls
-		   this hands them back that way. */
-		if (argv[2][0] == '~' &&
-		    (argv[2][1] == '/' || argv[2][1] == '\0')) {
-			const char *home = getenv("HOME");
-			snprintf(dir, sizeof dir, "%s%s", home ? home : "",
-				 argv[2] + 1);
-		} else {
-			snprintf(dir, sizeof dir, "%s", argv[2]);
-		}
-
-		struct stat st;
-		if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
-			notify("agent-sidebar: not a directory");
-			return 2;
-		}
-
-		/* Launch whatever the row was running: an opencode row starts
-		   opencode, anything else starts the default agent. Each is
-		   overridable, e.g. @agent_sidebar_command_opencode. */
-		const char *kind = (argc >= 4 && argv[3][0] != '\0')
-				   ? argv[3] : "claude";
-
-		char optname[96];
-		snprintf(optname, sizeof optname,
-			 "@agent_sidebar_command_%s", kind);
-
-		char cmd[256] = "";
-		char *opt[] = { (char *)"tmux", (char *)"show-option",
-				(char *)"-gqv", optname, NULL };
-		capture_all(opt, cmd, sizeof cmd);
-		char *nl = strchr(cmd, '\n');
-		if (nl != NULL)
-			*nl = '\0';
-
-		if (cmd[0] == '\0') {
-			/* the older single-command option still wins if set */
-			char *legacy[] = { (char *)"tmux",
-					   (char *)"show-option", (char *)"-gqv",
-					   (char *)"@agent_sidebar_new_command",
-					   NULL };
-			capture_all(legacy, cmd, sizeof cmd);
-			nl = strchr(cmd, '\n');
-			if (nl != NULL)
-				*nl = '\0';
-		}
-		if (cmd[0] == '\0')
-			snprintf(cmd, sizeof cmd, "%s", kind);
-
-		/* name after the directory, suffixed until it is free */
-		const char *base = strrchr(dir, '/');
-		base = (base != NULL && base[1] != '\0') ? base + 1 : dir;
-
-		char name[128];
-		snprintf(name, sizeof name, "%.*s",
-			 (int)(sizeof name - 5), base);
-		for (int i = 2; i < 100; i++) {
-			char *has[] = { (char *)"tmux", (char *)"has-session",
-					(char *)"-t", (char *)name, NULL };
-			if (run_tmux(has) != 0)
-				break;
-			snprintf(name, sizeof name, "%.*s-%d",
-				 (int)(sizeof name - 8), base, i);
-		}
-
-		char *mk[] = { (char *)"tmux", (char *)"new-session",
-			       (char *)"-d", (char *)"-s", name,
-			       (char *)"-c", dir, cmd, NULL };
-		if (run_tmux(mk) != 0) {
-			notify("agent-sidebar: could not create the session");
-			return 1;
-		}
-
-		/* move the client that asked to the session it just made */
-		char client[128] = "";
-		const char *self_pane = getenv("TMUX_PANE");
-		if (self_pane != NULL && *self_pane != '\0') {
-			char clients[2048];
-			char *lc[] = { (char *)"tmux", (char *)"list-clients",
-				       (char *)"-t", (char *)self_pane,
-				       (char *)"-F", (char *)"#{client_name}",
-				       NULL };
-			if (capture_all(lc, clients, sizeof clients) == 0) {
-				char *e = strchr(clients, '\n');
-				if (e != NULL)
-					*e = '\0';
-				snprintf(client, sizeof client, "%.*s",
-					 (int)(sizeof client - 1), clients);
-			}
-		}
-		if (client[0] != '\0') {
-			char *sw[] = { (char *)"tmux", (char *)"switch-client",
-				       (char *)"-c", client, (char *)"-t",
-				       name, NULL };
-			run_tmux(sw);
-		} else {
-			char *sw[] = { (char *)"tmux", (char *)"switch-client",
-				       (char *)"-t", name, NULL };
-			run_tmux(sw);
-		}
-		trace("new session=%s dir=%s kind=%s cmd=%s", name, dir,
-		      kind, cmd);
+	if (strcmp(verb, "--freeze") == 0) {
+		if (found != NULL)
+			agents_freeze_toggle(found->sess);
 		return 0;
 	}
-	if (argc >= 3 && strcmp(argv[1], "--kill") == 0) {
-		agent *found = agent_by_pid(atoll(argv[2]));
+	if (strcmp(verb, "--jump") == 0) {
+		if (found != NULL)
+			jump_client(found->pane_id);
+		return 0;
+	}
+	if (strcmp(verb, "--kill") == 0) {
 		if (found == NULL) {
 			notify("agent-sidebar: no agent with that pid");
 			return 2;
@@ -949,41 +988,65 @@ int main(int argc, char **argv)
 		}
 		return 0;
 	}
-	if (argc >= 3 && strcmp(argv[1], "--jump") == 0) {
-		agent *found = agent_by_pid(atoll(argv[2]));
-		if (found != NULL)
-			jump_to(found);
-		return 0;
-	}
-	if (argc >= 4 && strcmp(argv[1], "--rename-session") == 0) {
+	if (strcmp(verb, "--new") == 0)
+		return new_agent(argv[2], argc >= 4 ? argv[3] : "");
+	if (argc >= 4 && strcmp(verb, "--rename-session") == 0) {
 		/* No fallback to argv[2] as a session name: a pid that matches
 		   no agent was being handed to tmux as a target, which resolved
 		   to an unrelated session and renamed it. Refuse instead. */
-		agent *found = agent_by_pid(atoll(argv[2]));
-		if (found == NULL || found->sess[0] == '\0') {
+		if (found == NULL || found->pane_id[0] == '\0') {
 			notify("agent-sidebar: no agent with that pid");
 			return 2;
 		}
-		const char *old = found->sess;
-		if (argv[3][0] == '\0') {
+		char old[64], want[256], esc[512], got[256];
+		snprintf(old, sizeof old, "%s", found->sess);
+		if (strcmp(argv[3], "-") == 0)
+			take_input(want, sizeof want);
+		else
+			snprintf(want, sizeof want, "%s", argv[3]);
+		if (want[0] == '\0') {
 			notify("agent-sidebar: rename needs a name");
 			return 2;
 		}
+		if (fmt_escape(esc, sizeof esc, want) != 0) {
+			notify("agent-sidebar: that name is too long");
+			return 2;
+		}
 		char *rn[] = { (char *)"tmux", (char *)"rename-session",
-			       (char *)"-t", (char *)old, (char *)"--",
-			       argv[3], NULL };
+			       (char *)"-t", found->pane_id, (char *)"--", esc,
+			       NULL };
 		if (run_tmux(rn) != 0) {
 			notify("agent-sidebar: rename failed");
 			return 1;
 		}
-		park_rename(old, argv[3]);
-
-		/* wake any running sidebar rather than making it wait out the
-		   pane-map TTL */
-		char pd[512];
-		producer_dir(pd, sizeof pd);
-		utimensat(AT_FDCWD, pd, NULL, 0);
+		char *now[] = { (char *)"tmux", (char *)"display-message", (char *)"-p",
+				(char *)"-t", found->pane_id,
+				(char *)"#{session_name}", NULL };
+		if (tmux_capture(now, got, sizeof got) == 0)
+			got[strcspn(got, "\n")] = '\0';
+		else
+			snprintf(got, sizeof got, "%s", want);
+		lists_rename(old, got);
+		agents_refresh_panes();
 		return 0;
+	}
+	return -1;
+}
+
+int main(int argc, char **argv)
+{
+	static agent agents[AGENT_MAX];
+	static frame cur, prev;
+	int once = 0;
+	int force_width = 0;
+	int force_rows = 0;
+	int debug = 0;
+	int list = 0;
+
+	if (argc >= 2 && strncmp(argv[1], "--", 2) == 0) {
+		int rc = action(argc, argv);
+		if (rc >= 0)
+			return rc;
 	}
 
 	for (int i = 1; i < argc; i++) {
@@ -1017,26 +1080,20 @@ int main(int argc, char **argv)
 		long long now = now_ms();
 		for (int i = 0; i < n; i++) {
 			const agent *a = &agents[i];
-			long long secs = a->seen_ms > 0
-					 ? (now - a->seen_ms) / 1000 : 0;
-			char age[24];
-			if (secs < 60)
-				snprintf(age, sizeof age, "%llds", secs);
-			else if (secs < 3600)
-				snprintf(age, sizeof age, "%lldm", secs / 60);
-			else if (secs < 86400)
-				snprintf(age, sizeof age, "%lldh", secs / 3600);
-			else
-				snprintf(age, sizeof age, "%lldd", secs / 86400);
+			char age[16];
+			render_age(age, sizeof age, now, a->seen_ms);
 
-			/* hidden: pid, pane. shown: state, age, session, path */
+			/* hidden: pid, pane. shown: state, age, session, path.
+			   last, for actions: the kind */
 			printf("%lld\t%s\t%s%-7s\033[0m\t%5s\t%-18s\t%s\t%s\n",
 			       a->pid,
 			       a->pane_id[0] ? a->pane_id : "-",
 			       a->parked ? "\033[38;5;244m"
-					 : status_colour_for(a->status),
+			       : a->frozen ? frozen_colour()
+					   : status_colour_for(a->status),
 			       a->parked ? "parked"
-					 : agent_status_label(a->status),
+			       : a->frozen ? "frozen"
+					   : agent_status_label(a->status),
 			       age,
 			       a->sess[0] ? a->sess : a->name,
 			       a->cwd,
@@ -1058,23 +1115,19 @@ int main(int argc, char **argv)
 		return 0;
 	}
 
+	static tsession sessions[64];
+	char self[64];
+
 	if (once) {
 		int n = agents_load(agents, AGENT_MAX);
-		if (n < 0) {
-			fputs("agent-sidebar: cannot read the sessions "
-			      "directory\n", stderr);
-			return 1;
-		}
-		char self[64];
 		agents_self_session(self, sizeof self);
-		char sessions[64][64];
 		int nsess = g_show_sessions
 				    ? agents_sessions(sessions, 64, agents, n,
 						      g_exclude)
 				    : 0;
 		render_build(&cur, agents, n, cols,
 			     force_rows > 0 ? force_rows : FRAME_ROWS,
-			     now_ms(), self, sessions, nsess, g_legend);
+			     now_ms(), self, sessions, nsess, g_legend[0] != '\0');
 		for (int i = 0; i < cur.rows; i++)
 			printf("%s\033[0m\n", cur.line[i]);
 		return 0;
@@ -1088,25 +1141,26 @@ int main(int argc, char **argv)
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
 
-	char dir[512];
-	sessions_dir(dir, sizeof dir);
-
-	/* Watch both producer directories: the agent's own state, and the one
-	   plugins write to. A rename touches the latter deliberately, which is
-	   what makes a renamed session appear at once rather than on the TTL. */
-	char pdir[512];
-	producer_dir(pdir, sizeof pdir);
+	/* the agents' state, the plugins' and ours (lists, the pane map) */
+	char dirs[3][512];
+	sessions_dir(dirs[0], sizeof dirs[0]);
+	agents_state_path(dirs[1], sizeof dirs[1], "agents");
+	agents_state_path(dirs[2], sizeof dirs[2], "");
+	mkdir_p(dirs[1]); /* so the watch holds before a producer has run */
 
 	int ifd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
-	int watches = 0;
+	int watches = 0, state_wd = -1;
 	if (ifd >= 0) {
 		const uint32_t mask = IN_CLOSE_WRITE | IN_MOVED_TO |
 				      IN_CREATE | IN_DELETE | IN_MODIFY |
 				      IN_ATTRIB;
-		if (inotify_add_watch(ifd, dir, mask) >= 0)
-			watches++;
-		if (inotify_add_watch(ifd, pdir, mask) >= 0)
-			watches++;
+		for (int i = 0; i < 3; i++) {
+			int wd = inotify_add_watch(ifd, dirs[i], mask);
+			if (wd >= 0)
+				watches++;
+			if (i == 2)
+				state_wd = wd;
+		}
 	}
 	if (watches == 0 && ifd >= 0) {
 		close(ifd);
@@ -1122,35 +1176,42 @@ int main(int argc, char **argv)
 	emit("\033[?1049h\033[?25l\033[2J");
 	if (isatty(STDIN_FILENO))
 		tty_setup();
-	hold_width_init(cols);
 
 	prev.rows = 0;
-	int force = 1;
+	int force = 1, load = 1, redraw = 1, n = 0, nsess = 0;
+	long long next_tick = 0, next_load = 0;
 
 	while (!g_stop) {
 		if (g_winch) {
 			g_winch = 0;
-			term_size(STDOUT_FILENO, &cols, &rows);
-			hold_width(cols);
+			pane_size(&cols, &rows);
 			force = 1;
+			redraw = 1;
 		}
 
-		self_reexec_if_replaced();
-
-		int n = agents_load(agents, AGENT_MAX);
-		if (n < 0)
-			n = 0;
-		char self[64];
-		agents_self_session(self, sizeof self);
-		char sessions[64][64];
-		int nsess = g_show_sessions
-				    ? agents_sessions(sessions, 64, agents, n,
-						      g_exclude)
-				    : 0;
-		render_build(&cur, agents, n, cols, rows, now_ms(), self,
-			     sessions, nsess, g_legend);
-		render_flush(STDOUT_FILENO, &cur, &prev, force);
-		force = 0;
+		/* files on a change, or every 5s for the liveness checks; the
+		   1s tick only redraws, to keep the age column honest */
+		long long now = mono_ms();
+		if (load || now >= next_load) {
+			self_reexec_if_replaced();
+			n = agents_load(agents, AGENT_MAX);
+			agents_self_session(self, sizeof self);
+			nsess = g_show_sessions
+					? agents_sessions(sessions, 64, agents, n,
+							  g_exclude)
+					: 0;
+			load = 0;
+			redraw = 1;
+			next_load = now + 5000;
+		}
+		if (redraw || now >= next_tick) {
+			render_build(&cur, agents, n, cols, rows, now_ms(), self,
+				     sessions, nsess, g_legend[0] != '\0');
+			render_flush(STDOUT_FILENO, &cur, &prev, force);
+			force = 0;
+			redraw = 0;
+			next_tick = now + 1000;
+		}
 
 		struct pollfd pfd[2];
 		int nfds = 0;
@@ -1167,24 +1228,25 @@ int main(int argc, char **argv)
 			slot_stdin = nfds++;
 		}
 
-		int rc = poll(nfds > 0 ? pfd : NULL, (nfds_t)nfds, 1000);
+		long long wait = (next_tick < next_load ? next_tick : next_load) - mono_ms();
+		int rc = poll(nfds > 0 ? pfd : NULL, (nfds_t)nfds,
+			      wait > 0 ? (int)wait : 0);
 		if (rc < 0) {
 			if (errno == EINTR)
 				continue;
 			break;
 		}
 		if (rc > 0 && slot_inotify >= 0 &&
-		    (pfd[slot_inotify].revents & POLLIN)) {
-			char drain[4096];
-			while (read(ifd, drain, sizeof drain) > 0)
-				; /* the rebuild above re-reads the truth */
-			agents_invalidate();
+		    (pfd[slot_inotify].revents & POLLIN))
+			load |= events_matter(ifd, state_wd);
+		if (rc > 0 && slot_stdin >= 0) {
+			if (pfd[slot_stdin].revents & (POLLHUP | POLLERR | POLLNVAL))
+				break; /* the pane is gone */
+			if (pfd[slot_stdin].revents & POLLIN) {
+				handle_input(&cur, agents, n);
+				redraw = 1;
+			}
 		}
-		if (rc > 0 && slot_stdin >= 0 &&
-		    (pfd[slot_stdin].revents & POLLIN))
-			handle_input(&cur, agents, n);
 	}
-
-	tty_restore();
 	return 0;
 }

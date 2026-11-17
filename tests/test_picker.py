@@ -92,6 +92,10 @@ try:
 finally:
     tm("kill-server")
     shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        os.unlink("/tmp/tmux-%d/%s" % (os.getuid(), sock))
+    except OSError:
+        pass
 
 print()
 if fails:
