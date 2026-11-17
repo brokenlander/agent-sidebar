@@ -79,6 +79,8 @@ scratch popup wants a bare terminal, not the panel.
   shortcuts. They come from `@agent_sidebar_legend`, as `key label` entries
   separated by `;` so a key can be `|` or `-`, e.g.
   `'e sidebar;| split right;- split down'`. tmux draws each key on the right.
+  A word ending in `:` starts a titled section, so
+  `'agents:;a new agent;q end agent;tmux:;| split right'` shows two groups.
   The menu only shows them; choosing an item does nothing. Leave the option
   unset and there is no button.
 - **Freeze** (`f` on the menu, `alt-f` in the picker) sets an agent aside for
@@ -283,7 +285,7 @@ No dependencies beyond libc.
 | `@agent_sidebar_key` | `e` | `prefix + key` opens or closes every sidebar |
 | `@agent_sidebar_picker_key` | `g` | `prefix + key` opens the picker |
 | `@agent_sidebar_picker_width`, `_height` | `95%` | the picker popup's size |
-| `@agent_sidebar_legend` | unset | `key label;...` for the `? shortcuts` menu |
+| `@agent_sidebar_legend` | unset | `key label;...` for the `? shortcuts` menu; `title:` starts a section |
 | `@agent_sidebar_sessions` | off | `on` lists sessions with no agent |
 | `@agent_sidebar_exclude` | unset | sessions that never get a sidebar, `a\|b*` |
 | `@agent_sidebar_idle_wait` | `30` | minutes idle before amber; `0` disables |

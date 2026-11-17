@@ -38,7 +38,7 @@ try:
     evil = "victim'; set -g @pwned 1; display '"
     tm("new-session", "-d", "-s", evil, "-x", "100", "-y", "44", "sleep 600")
     tm("set", "-g", "@agent_sidebar_sessions", "on")
-    tm("set", "-g", "@agent_sidebar_legend", "e sidebar;o agents;y sesh")
+    tm("set", "-g", "@agent_sidebar_legend", "herd:;e sidebar;o agents;tmux:;y sesh")
     tm("set", "-g", "mouse", "on")
 
     pid = tm("list-panes", "-t", "alpha", "-F", "#{pane_pid}").split()[0]
@@ -107,6 +107,8 @@ try:
                 os.write(fd, b"q"); drain(0.5)
                 break
         check(listed, "clicking it lists the shortcuts with their keys")
+        check(listed and b"herd" in shown and b"tmux" in shown and b"herd:" not in shown
+              and b"(h)" not in shown, "a word ending in ':' titles a section")
 
     # click the plain.box row -> the client jumps to it
     rows = view().split("\n")

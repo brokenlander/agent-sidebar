@@ -398,6 +398,7 @@ static int menu_head(char **argv, const char *title)
 	argv[k++] = (char *)"P";
 	argv[k++] = (char *)"-y";
 	argv[k++] = (char *)"P";
+	argv[k++] = (char *)"--";
 	return k;
 }
 
@@ -546,25 +547,36 @@ static void open_session_menu(const char *name, const char *id)
 static char g_legend[1024];
 
 /* @agent_sidebar_legend ("key label;..."; ';' so a key can be '|') as a menu
-   that only shows them. */
+   that only shows them. A word ending in ':' starts a titled section. */
 static void open_keys_menu(void)
 {
 	char *argv[200];
 	char items[2048];
 	size_t o = 0;
 	int k = menu_head(argv, "#[align=centre] #{prefix} + key ");
+	const int first = k;
 
 	for (const char *p = g_legend; *p != '\0'; p += *p == ';') {
 		size_t len = strcspn(p, ";");
 		const char *sp = memchr(p, ' ', len);
+		int title = sp == NULL && len > 1 && p[len - 1] == ':';
 		const char *label = sp != NULL ? sp + 1 : p;
 		size_t klen = sp != NULL ? (size_t)(sp - p) : 0;
-		size_t llen = len - (size_t)(label - p);
+		size_t llen = len - (size_t)(label - p) - (size_t)title;
 
-		if (k + 4 > (int)(sizeof argv / sizeof argv[0]) ||
-		    o + klen + 2 * llen + 2 > sizeof items)
+		if (k + 8 > (int)(sizeof argv / sizeof argv[0]) ||
+		    o + klen + 2 * llen + 12 > sizeof items)
 			break;
+		if (title && k > first) {
+			argv[k++] = (char *)"";
+			argv[k++] = (char *)"";
+			argv[k++] = (char *)"";
+		}
 		argv[k++] = items + o;
+		if (title) {
+			memcpy(items + o, "-#[bold]", 8);
+			o += 8;
+		}
 		for (size_t i = 0; i < llen; i++) {
 			if (label[i] == '#') /* a label is a format */
 				items[o++] = '#';
