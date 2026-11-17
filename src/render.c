@@ -239,12 +239,13 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 
 	/* Reserve the bottom so a long agent list never pushes it off: agents
 	   fill the top and overflow with a "+N more" line, then the
-	   other-sessions section, then the shortcuts button on the last row. */
+	   other-sessions section, then the shortcuts button with a blank row
+	   under it. */
 	int avail = rows - f->rows;
 	if (avail < 1)
 		avail = 1;
 
-	int keys_h = keys && avail > 1 ? 1 : 0;
+	int keys_h = !keys ? 0 : avail > 2 ? 2 : avail > 1 ? 1 : 0;
 
 	int sess_shown = nsessions;
 	int sess_h = nsessions > 0 ? 2 + nsessions : 0;
@@ -369,9 +370,9 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 		}
 	}
 
-	/* pinned to the last row, so it stays put while the list changes */
+	/* pinned to the bottom, so it stays put while the list changes */
 	if (keys_h > 0) {
-		while (rows < FRAME_ROWS && f->rows < rows - 1) {
+		while (rows < FRAME_ROWS && f->rows < rows - keys_h) {
 			lb_init(&lb, cols);
 			put_line(f, &lb, -1);
 		}
@@ -383,6 +384,10 @@ void render_build(frame *f, const agent *a, int n, int cols, int rows,
 			lb_text(&lb, " shortcuts");
 			lb_raw(&lb, C_RESET);
 			f->keys_row = f->rows;
+			put_line(f, &lb, -1);
+		}
+		if (keys_h > 1 && rows < FRAME_ROWS) {
+			lb_init(&lb, cols);
 			put_line(f, &lb, -1);
 		}
 	}

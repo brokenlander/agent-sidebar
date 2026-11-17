@@ -75,7 +75,7 @@ scratch popup wants a bare terminal, not the panel.
 - **Right-click a row** to park it directly, without the menu. Parked agents
   sink below everything else, whatever they are doing, and render as a hollow
   dimmed dot. Click again to bring one back.
-- **Click `? shortcuts`**, the sidebar's last row, for a menu of your tmux
+- **Click `? shortcuts`**, at the bottom of the sidebar, for a menu of your tmux
   shortcuts. They come from `@agent_sidebar_legend`, as `key label` entries
   separated by `;` so a key can be `|` or `-`, e.g.
   `'e sidebar;| split right;- split down'`. tmux draws each key on the right.

@@ -21,8 +21,9 @@ const char *frozen_colour(void);
 
 /* self_sess: the session the sidebar runs in; its agent is drawn as current.
    sessions/nsessions: tmux sessions with no agent, listed below the agents.
-   keys: draw the shortcuts button on the last row; rows of FRAME_ROWS means
-   unbounded (--once), and the button then follows the list. */
+   keys: draw the shortcuts button at the bottom with a blank row under it;
+   rows of FRAME_ROWS means unbounded (--once), and the button then follows
+   the list. */
 void render_build(frame *f, const agent *a, int n, int cols, int rows,
 		  long long now_ms, const char *self_sess,
 		  const tsession *sessions, int nsessions, int keys);

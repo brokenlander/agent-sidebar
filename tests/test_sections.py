@@ -2,8 +2,8 @@
 """The sidebar's optional sections: non-agent tmux sessions and the shortcuts.
 
 With @agent_sidebar_sessions on, sessions holding no agent are listed below the
-agents and are clickable to jump. With @agent_sidebar_legend set, the last row
-is one button that opens the shortcuts as a tmux menu.
+agents and are clickable to jump. With @agent_sidebar_legend set, one button at
+the bottom opens the shortcuts as a tmux menu.
 """
 import fcntl, json, os, pty, re, select, shutil, struct, subprocess, sys, tempfile, termios, time
 
@@ -86,11 +86,11 @@ try:
           "a non-agent session is listed in its own section")
     check("alpha" not in view().split("sessions")[1] if "sessions" in view() else False,
           "the agent session is not duplicated under sessions")
-    def last_row():
-        return view().rstrip("\n").split("\n")[-1]
-    check(wait(lambda: "shortcuts" in last_row(), 5) and "sesh" not in view(),
-          "the shortcuts are one button on the last row")
-    if "shortcuts" in last_row():
+    def bottom():
+        return (["", ""] + view().split("\n")[:-1])[-2:]
+    check(wait(lambda: "shortcuts" in bottom()[0] and bottom()[1].strip() == "", 5)
+          and "sesh" not in view(), "the shortcuts are one button with a blank row under it")
+    if "shortcuts" in bottom()[0]:
         # the status line may sit above the pane, so try the rows around it
         brow = len(view().rstrip("\n").split("\n"))
         listed = False
