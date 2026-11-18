@@ -14,6 +14,17 @@ The opencode plugin is installed as a symlink at
 writes its file within ~8s of opencode starting, and removes it on exit, so a
 killed agent leaves no stale row.
 
+The opencode plugin also joins the agent to `pm-board` (in the dotfiles repo)
+when that script is at `~/dotfiles/bin/pm-board` or named by `PM_BOARD`: notes
+addressed to the agent ride on its next prompt and its next tool result, an
+edit of a path another agent holds is refused once with the holder's name, and
+a wake flag left by `pm-board post --wake` prompts an idle session with the
+note. Without the script every one of those is a no-op.
+
+opencode 1.19 sends `message.updated` after `session.idle`. Once a
+`session.status` event has been seen it alone decides busy or idle, or every
+agent would read busy for ever.
+
 Reading what an agent last *said* is a separate thing and needs no producer at
 all — every provider already streams its conversation to disk. `pm-lastsaid` in
 the dotfiles repo has one adapter per format (claude JSONL, codex rollout JSONL,
