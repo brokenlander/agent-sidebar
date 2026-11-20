@@ -97,7 +97,7 @@ grep -qx "alpha" "$XDG_STATE_HOME/agent-sidebar/parked" 2>/dev/null \
 make_agent asker waiting 3500000
 sleep 2
 # only the dot carries the state colour on a live row; the name keeps its own
-$TM capture-pane -p -e -t "$PANE" | grep -A0 'asker' | grep -q '38;2;215;166;255m ●' \
+$TM capture-pane -p -e -t "$PANE" | grep -A0 'asker' | grep -q '35m ●' \
 	&& check 0 "a reported waiting agent has a purple dot" || check 1 "a reported waiting agent has a purple dot"
 sb --list | grep asker | grep -q asking \
 	&& check 0 "--list calls it asking" || check 1 "--list calls it asking"
@@ -117,7 +117,7 @@ click "$PANE" 2 "$(row_of bravo)"; sleep 2   # park bravo: it must land under al
 [ "$(row_of bravo)" -gt "$(row_of alpha)" ] \
 	&& check 0 "and above a parked one" || check 1 "and above a parked one"
 click "$PANE" 2 "$(row_of bravo)"; sleep 1   # un-park bravo
-$TM capture-pane -p -e -t "$PANE" | grep -q '38;2;61;89;161m ● alpha' \
+$TM capture-pane -p -e -t "$PANE" | grep -q '36m ● alpha' \
 	&& check 0 "a frozen row is deep blue" || check 1 "a frozen row is deep blue"
 sb --freeze "$(pid_of alpha)"; sleep 2
 grep -qx "alpha" "$XDG_STATE_HOME/agent-sidebar/frozen" 2>/dev/null \

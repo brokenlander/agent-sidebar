@@ -76,12 +76,13 @@ static void lb_pad_to(linebuf *lb, int col)
 }
 
 #define C_RESET "\033[0m"
-/* Tokyo Night: dim #565f89, accent #7aa2f7 */
-#define C_DIM "\033[38;2;86;95;137m"
-#define C_HEAD "\033[38;2;122;162;247m"
-#define C_NAME "\033[38;2;145;180;250m" /* running agents */
-#define C_SELF "\033[38;2;240;244;255m" /* the agent of this session: near white */
-#define C_FROZEN "\033[38;2;61;89;161m" /* deep blue - kept for later */
+/* ANSI palette colours, not fixed RGB: the sidebar follows whatever theme the
+ * terminal has (Omarchy's current theme, Tokyo Night, ...). */
+#define C_DIM "\033[90m"    /* bright black: secondary text */
+#define C_HEAD "\033[34m"   /* blue: the theme's accent */
+#define C_NAME "\033[94m"   /* bright blue: running agents */
+#define C_SELF "\033[97m"   /* bright white: the agent of this session */
+#define C_FROZEN "\033[36m" /* cyan - kept for later */
 
 static const char *status_colour(agent_status s);
 
@@ -98,10 +99,10 @@ const char *frozen_colour(void)
 static const char *status_colour(agent_status s)
 {
 	switch (s) {
-	case ST_ASKING:  return "\033[38;2;215;166;255m"; /* purple - asking you */
-	case ST_WAITING: return "\033[38;2;224;175;104m"; /* amber - forgotten */
-	case ST_IDLE:    return "\033[38;2;158;206;106m"; /* green - your turn */
-	case ST_BUSY:    return "\033[38;2;247;118;142m"; /* red   - working */
+	case ST_ASKING:  return "\033[35m"; /* magenta - asking you */
+	case ST_WAITING: return "\033[33m"; /* yellow - forgotten */
+	case ST_IDLE:    return "\033[32m"; /* green - your turn */
+	case ST_BUSY:    return "\033[31m"; /* red   - working */
 	default:         return C_DIM;
 	}
 }
