@@ -309,6 +309,46 @@ Or run it in any pane directly:
 ./agent-sidebar --once     # print one frame and exit
 ```
 
+## Agent tools
+
+Beyond the sidebar, this repo carries the workflow around it. Full guide:
+[docs/workflow.md](docs/workflow.md).
+
+| Path | What |
+|---|---|
+| `bin/agent` | start an agent in a folder (or a workspace slot); `--reset`, `--restart`, `--slots` |
+| `bin/agent-pick` | fuzzy picker for where to start one (`prefix a`) |
+| `bin/agent-end`, `agent-reopen`, `agent-branch` | end an agent, reopen a closed conversation, branch one |
+| `bin/agent-board` (+ `agent-board-hook`) | shared board: who works on what, claims, notes between agents |
+| `bin/agent-roster`, `agent-conversations`, `agent-lastsaid` | who is live, past conversations, an agent's last message |
+| `tmux/agents.conf` | the tmux keys for all of the above, plus the sidebar settings |
+| `tmux/claude-panes.sh`, `claude-pane-hook.sh` | agent panes come back with their conversation after a tmux-resurrect restore |
+| `briefing.md` | what agents are told about each other and the board |
+| `bin/herd`, `workspace/` | the container install mode (browser-terminal workspaces); see [workspace/README.md](workspace/README.md) |
+
+Two install modes:
+
+- **Desktop**: put `bin/` on `PATH`, `source-file ~/forge/agent-sidebar/tmux/agents.conf`
+  from your tmux config, and add the board and pane-restore hooks to Claude Code's
+  settings (the author's dotfiles do this in `scripts/agents-setup.sh`).
+- **Workspace** (containers): `workspace/build-bundle.sh`, then `workspace/install.sh` there.
+
+**Optional workspace with slots.** Several agents can work on the same project side
+by side, each in its own "slot" (`<workspace>/Agent1`, `Agent2`, …) with one worktree
+per repo. Configure it per machine in `~/.config/agent-sidebar/workspace`:
+
+```sh
+AGENT_WS="$HOME/forge/myproject"   # the workspace checkout
+AGENT_WS_REPOS="api web helm"      # its repos, one worktree each per slot
+AGENT_WS_NAME="myproject"          # session names: myproject-a1, -a2, ...
+```
+
+Without it there are no slots, and agents start in whatever folder you pick.
+
+**Tests.** `make test` covers the sidebar. `tests/test_board_notmux.py` checks the
+board without tmux; it is timing-sensitive and can fail intermittently on a busy
+machine (it gives its fake agents 0.3 s to start).
+
 ## Credit
 
 The picker's interaction design - a popup fzf list over the running agents,

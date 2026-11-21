@@ -1,0 +1,39 @@
+#!/usr/bin/env sh
+# agent-pick: prefix a. Pick where to open an agent, then hand off to
+# agent. Enter starts the agent used last; ^y, ^o and ^x pick another.
+set -u
+. "$HOME/forge/agent-sidebar/tmux/fzf-theme.sh"
+. "$HOME/forge/agent-sidebar/bin/agent-defs"
+PM="$AGENT_WS"   # optional workspace (agent-defs); empty = none
+AGENT="$HOME/forge/agent-sidebar/bin/agent"
+FD="$(command -v fdfind 2>/dev/null || command -v fd 2>/dev/null || echo find)"
+
+last="$(agent_last)"
+
+list() {
+	[ -n "$PM" ] && [ -d "$PM/.git" ] && printf '%s\n' "$PM"
+	command -v zoxide >/dev/null 2>&1 && zoxide query -l 2>/dev/null
+}
+
+out="$(list | awk 'NF && !seen[$0]++' | sed "s|^$HOME/|~/|" | fzf \
+	--expect=ctrl-y,ctrl-o,ctrl-x \
+	--border-label " 󰚩  new agent · $(agent_window "$last") " \
+	--prompt '  where › ' \
+	--header "${AGENT_WS_NAME:+$AGENT_WS_NAME → its own AgentN slot   ·   }any folder → an agent there   ·   ^f find
+enter → $last (last used)   ·   ^y claude   ^o opencode   ^x codex" \
+	--preview 'p=$(echo {} | sed "s|^~/|'"$HOME"'/|"); git -C "$p" -c color.ui=always status -sb 2>/dev/null || ls -la "$p" 2>/dev/null | head -40' \
+	--preview-window 'right,56%,border-rounded' \
+	--bind "ctrl-f:change-prompt(  find › )+reload($FD -H -t d -d 4 . $HOME 2>/dev/null | sed 's|^$HOME/|~/|')")"
+
+key="$(printf '%s\n' "$out" | sed -n 1p)"
+sel="$(printf '%s\n' "$out" | sed -n 2p)"
+[ -n "$sel" ] || exit 0
+
+case "$key" in
+ctrl-y) agent=claude ;;
+ctrl-o) agent=opencode ;;
+ctrl-x) agent=codex ;;
+*) agent="$last" ;;
+esac
+
+exec "$AGENT" --agent "$agent" "$(printf '%s' "$sel" | sed "s|^~/|$HOME/|")"

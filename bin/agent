@@ -1,0 +1,422 @@
+#!/usr/bin/env sh
+# agent [DIR]         start an agent: the configured workspace gets a free
+#                        AgentN slot of worktrees, any other dir a plain agent
+#   -a, --agent ID       claude, opencode or codex (default: the last one used)
+#   -n, --dry-run        show which slot would be picked
+#   -l, --slots          every slot and who holds it
+#   --reset [SESSION]    start over: slot back to origin/main, new conversation
+#   --restart [SESSION]  new process, same conversation, nothing wiped
+#   --prune [--yes]      plan, or apply, the cleanup of what ended sessions left
+#   --rename             type /rename into live claude panes whose name drifted
+set -u
+. "$HOME/forge/agent-sidebar/bin/agent-defs"
+
+mode=run; TARGET=""; RS=""; AGENT_ID=""; AGENT_EXPLICIT=0; YES=0
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--agent | -a) AGENT_ID="${2:-}"; AGENT_EXPLICIT=1; shift; [ $# -gt 0 ] && shift ;;
+	--dry-run | -n) mode=dry; shift ;;
+	--slots | -l) mode=slots; shift ;;
+	--rename) mode=rename; shift ;;
+	--prune) mode=prune; shift ;;
+	--yes | -y) YES=1; shift ;;
+	--restart | --reset | -r)
+		[ "$1" = --restart ] && mode=restart || mode=reset
+		shift
+		case "${1:-}" in -* | "") : ;; *) RS="$1"; shift ;; esac ;;
+	*) TARGET="$1"; shift ;;
+	esac
+done
+
+say() { printf '  %s\n' "$*"; }
+die() { printf 'agent: %s\n' "$*" >&2; exit 1; }
+
+[ -n "$AGENT_ID" ] || AGENT_ID="$(agent_last)"
+agent_valid "$AGENT_ID" || die "unknown agent $AGENT_ID (known: $PM_AGENTS)"
+
+WS="$AGENT_WS"
+REPOS="$AGENT_WS_REPOS"
+RECENT_SECS=$((48 * 3600))
+# The workspace is only needed for its slots; an agent in any other folder works
+# without one (see agent-defs for the optional workspace config).
+need_ws() {
+	[ -n "$WS" ] || die "no workspace configured (~/.config/agent-sidebar/workspace); pick a folder instead"
+	[ -d "$WS/.git" ] || die "$WS is not the workspace checkout"
+}
+if [ "$mode" = run ]; then
+	case "${TARGET:-}" in
+	"" | "$WS" | "$WS/") need_ws ;;
+	esac
+fi
+
+launch_session() {  # cwd  brief  session  [slot]  [command]
+	_cwd="$1"; _brief="$2"; _sess="$3"; _slot="${4:-}"; _cmd="${5:-}"
+	[ -n "$_cmd" ] || _cmd="$(agent_cmd "$AGENT_ID" "$_brief" "$_sess")"
+	sid="$(tmux new-session -d -P -F '#{session_id}' -s "$(printf '%s' "$_sess" | sed 's/#/##/g')" \
+		-n "$(agent_window "$AGENT_ID")" -c "$_cwd" "$_cmd" 2>/dev/null)"
+	[ -n "$sid" ] || die "could not start the tmux session"
+	tmux set-option -t "$sid" @pm_agent "$AGENT_ID"
+	agent_remember "$AGENT_ID"
+	[ -n "$_slot" ] && tmux set-option -t "$sid" @pm_slot "$_slot"
+	tmux new-window -d -t "$sid" -n board "$HOME/forge/agent-sidebar/bin/agent-board watch"
+	say "launched session $_sess ($AGENT_ID)"
+	if [ -n "${PM_CLIENT:-}" ]; then tmux switch-client -c "$PM_CLIENT" -t "$sid" 2>/dev/null
+	elif [ -n "${TMUX:-}" ]; then tmux switch-client -t "$sid"
+	elif [ -t 1 ]; then tmux attach -t "$sid"
+	fi
+}
+
+# Read off the live process: the pane's @claude_session tag goes stale on resume and compact.
+session_resume_cmd() {  # session id  session name
+	tmux list-panes -s -t "$1" -F "#{pane_pid}$TAB#{pane_current_command}" 2>/dev/null |
+		while IFS="$TAB" read -r _pp _a; do
+			agent_valid "$_a" || continue
+			_ap="$(agent_pid_of "$_pp" "$_a")" || continue
+			_id=""; _ar=""
+			if [ "$_a" = claude ]; then
+				_id="$(jq -r '.sessionId // .session_id // empty' \
+					"$HOME/.claude/sessions/$_ap.json" 2>/dev/null)"
+				[ -n "$_id" ] || continue
+				_ar="$("$HOME/forge/agent-sidebar/tmux/claude-panes.sh" args "$_ap")"
+			fi
+			agent_resume_cmd "$_a" "$_id" "$_ar" "$2" && break
+		done
+}
+
+prep_slot() {  # slot number
+	_d="$WS/Agent$1"
+	say "fetching origin/main…"
+	for r in $REPOS; do git -C "$WS/$r" fetch -q --prune origin 2>/dev/null & done
+	wait
+	mkdir -p "$_d"
+	for r in $REPOS; do
+		wt="$_d/$r"
+		git -C "$WS/$r" worktree prune -q 2>/dev/null
+		if git -C "$wt" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+			git -C "$wt" checkout -q --detach 2>/dev/null
+			git -C "$wt" reset -q --hard origin/main
+			git -C "$wt" clean -qfd
+		else
+			git -C "$WS/$r" worktree add -q --detach "$wt" origin/main ||
+				say "! could not create $wt (stray dir?), skipping"
+		fi
+	done
+	say "sub-repos reset to origin/main"
+}
+
+write_brief() {  # slot  dir  session
+	_board="$("$HOME/forge/agent-sidebar/bin/agent-board" ls --brief --for "${3:-}" 2>/dev/null)"
+	_mine=""
+	printf '%s\n' "$_board" | grep -q '^YOU ' &&
+		_mine="The YOU line is this session's status, left by the agent before you: it is what that agent was in the middle of.
+"
+	cat >"$2/.agent-brief" <<EOF
+Session bootstrap — do not treat this as a task.
+
+Your isolated worktree slot for this session is Agent$1. Do ALL file work
+inside $2/<repo> (one per repo in the workspace) — never the canonical
+checkouts at $WS/<repo>. The five sub-repos here are freshly reset to origin/main
+on a detached HEAD; branch off before you start, e.g.
+  git -C Agent$1/app checkout -b fix/issue-NNN
+
+The board, what the rest of the fleet is working on right now:
+$_board
+${_mine}Once you have a task, say what you are on there (agent-board claim, see "Other agents" in your instructions).
+
+Acknowledge in one line which slot you're in, then wait for my task.
+EOF
+}
+
+# The text in an agent pane's prompt box: the lines between the last two rule
+# lines (the top one carries the session name) when the first starts with ❯.
+# Fails when no box is on screen.
+prompt_box() {  # pane
+	tmux capture-pane -p -t "$1" 2>/dev/null | awk '
+		/^────/ && /─[ \t]*$/ {
+			if (open && n > 0) { box = cur; found = 1; open = 0 } else { open = 1; cur = ""; n = 0 }
+			next
+		}
+		open { if (n++ == 0 && $0 !~ /^❯/) { open = 0; next } cur = cur $0 "\n" }
+		END { if (!found) exit 1; printf "%s", box }'
+}
+
+if [ "$mode" = rename ]; then
+	tmp="$(mktemp)"
+	tmux list-panes -a -F "#{pane_id}$TAB#{pane_pid}$TAB#{pane_current_command}$TAB#{pane_in_mode}$TAB#{session_name}" \
+		>"$tmp" 2>/dev/null
+	did=0; busy=0; draft=0; fail=0
+	while IFS="$TAB" read -r pane ppid cmd inmode sess; do
+		[ "$cmd" = claude ] || continue
+		cpid="$(agent_pid_of "$ppid" claude)" || continue
+		f="$HOME/.claude/sessions/$cpid.json"
+		[ -f "$f" ] || continue
+		cur="$(jq -r '.name // empty' "$f" 2>/dev/null)"
+		[ "$cur" = "$sess" ] && continue
+		case "$(jq -r '.status // empty' "$f" 2>/dev/null)" in
+		busy) say "busy   $sess (still $cur), rerun when it is idle"; busy=$((busy + 1)); continue ;;
+		esac
+		if [ "$inmode" = 1 ]; then
+			say "busy   $sess (still $cur), it is scrolled back"; busy=$((busy + 1)); continue
+		fi
+		# Keys typed onto a draft would be submitted with it; an empty box is padded with U+00A0.
+		if ! box="$(prompt_box "$pane")"; then
+			say "busy   $sess (still $cur), no prompt box on screen"; busy=$((busy + 1)); continue
+		fi
+		if [ -n "$(printf '%s' "$box" | sed 's/^❯//' | tr -d '\302\240 \t\n')" ]; then
+			say "draft  $sess (still $cur), clear its prompt box first"
+			draft=$((draft + 1)); continue
+		fi
+		tmux send-keys -l -t "$pane" "/rename $sess"
+		sleep 0.3
+		tmux send-keys -t "$pane" Enter
+		sleep 1
+		if [ "$(jq -r '.name // empty' "$f" 2>/dev/null)" = "$sess" ]; then
+			say "named  $cur → $sess"
+			did=$((did + 1))
+		else
+			say "FAILED $sess, check that pane"
+			fail=$((fail + 1))
+		fi
+	done <"$tmp"
+	rm -f "$tmp"
+	say "$did renamed, $busy busy, $draft with drafts, $fail failed"
+	exit 0
+fi
+
+if [ "$mode" = reset ] || [ "$mode" = restart ]; then
+	rid="$(sess_id "${RS:-$(tmux display-message -p '#{session_id}' 2>/dev/null)}")"
+	[ -n "$rid" ] || die "no session to $mode"
+	rs="$(tmux display-message -p -t "$rid" '#{session_name}')"
+	ragent="$(tmux show-options -t "$rid" -v -q @pm_agent 2>/dev/null)"
+	[ "$AGENT_EXPLICIT" = 1 ] || { agent_valid "$ragent" && AGENT_ID="$ragent"; }
+	rslot="$(tmux show-options -t "$rid" -v -q @pm_slot 2>/dev/null)"
+	PM_CLIENT="$(tmux list-clients -t "$rid" -F '#{client_name}' 2>/dev/null | head -n 1)"
+	export PM_CLIENT
+	rcwd="$(tmux list-panes -s -t "$rid" -F "#{pane_current_command}$TAB#{pane_current_path}" 2>/dev/null |
+		awk -F"$TAB" -v ags="$PM_AGENTS" 'BEGIN{n=split(ags,a," ")}
+			{for(i=1;i<=n;i++) if($1==a[i]) {print $2; exit}}')"
+	[ -n "$rcwd" ] || rcwd="$HOME"
+	rdir=""; [ -n "$rslot" ] && [ -d "$WS/Agent$rslot" ] && rdir="$WS/Agent$rslot"
+
+	if [ "$mode" = restart ]; then
+		rcmd="$(session_resume_cmd "$rid" "$rs")"
+		[ -n "$rcmd" ] || say "no conversation to resume, starting fresh"
+		say "restarting $rs, nothing wiped…"
+		tmux kill-session -t "$rid" 2>/dev/null
+		if [ -n "$rdir" ]; then
+			[ -n "$rcmd" ] || write_brief "$rslot" "$rdir" "$rs"
+			launch_session "$WS" "$rdir/.agent-brief" "$rs" "$rslot" "$rcmd"
+		else
+			launch_session "$rcwd" "" "$rs" "" "$rcmd"
+		fi
+	elif [ -n "$rdir" ]; then
+		say "resetting $rs (Agent$rslot): fresh main, fresh conversation…"
+		tmux kill-session -t "$rid" 2>/dev/null
+		need_ws
+		prep_slot "$rslot"
+		write_brief "$rslot" "$rdir" "$rs"
+		launch_session "$WS" "$rdir/.agent-brief" "$rs" "$rslot"
+	else
+		say "resetting $rs in $rcwd: fresh conversation…"
+		tmux kill-session -t "$rid" 2>/dev/null
+		launch_session "$rcwd" "" "$rs"
+	fi
+	exit 0
+fi
+
+if [ -n "$TARGET" ]; then
+	TARGET="$(cd "$TARGET" 2>/dev/null && pwd)" || die "no such directory"
+fi
+if [ -n "$TARGET" ] && [ "$TARGET" != "$WS" ]; then
+	repo="$(git -C "$TARGET" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$TARGET")"
+	say "agent in $repo"
+	launch_session "$repo" "" "$(uniq_sess "$(basename "$repo")")"
+	exit 0
+fi
+
+SESSIONS="$(tmux list-sessions -F "#{@pm_slot}$TAB#{session_name}" 2>/dev/null)"
+PANES="$(tmux list-panes -a -F "#{pane_current_path}$TAB#{session_name}$TAB#{pane_current_command}" 2>/dev/null)"
+
+# A slot is held by the session stamped with it and by any session with a pane inside it.
+slot_sessions() {
+	{
+		printf '%s\n' "$SESSIONS" | awk -F"$TAB" -v n="$1" '$1==n {print $2}'
+		printf '%s\n' "$PANES" | awk -F"$TAB" -v p="$WS/Agent$1" '$1==p || index($1, p "/")==1 {print $2}'
+	} | awk 'NF && !seen[$0]++'
+}
+
+slot_holder() { slot_sessions "$1" | head -n 1; }
+
+# Held, with no agent left in the sessions holding it. Inferred: a crash fires no hook.
+slot_orphaned() {
+	_held="$(slot_sessions "$1")"
+	[ -n "$_held" ] || return 1
+	printf '%s\n' "$PANES" | HELD="$_held" awk -F"$TAB" -v ags="$PM_AGENTS" '
+		BEGIN { n=split(ags,a," "); m=split(ENVIRON["HELD"],h,"\n"); for(i=1;i<=m;i++) held[h[i]]=1 }
+		($2 in held) { for(i=1;i<=n;i++) if($3==a[i]) { alive=1; exit } }
+		END { exit alive }'
+}
+
+slot_dirty() {
+	for r in $REPOS; do
+		wt="$WS/Agent$1/$r"; [ -d "$wt" ] || continue
+		[ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ] && return 0
+	done
+	return 1
+}
+
+newest_change() {  # worktree -> epoch of its newest uncommitted file
+	git -C "$1" status --porcelain 2>/dev/null | sed 's/^...//; s/.* -> //' |
+		while IFS= read -r f; do [ -e "$1/$f" ] && stat -c %Y "$1/$f" 2>/dev/null; done |
+		sort -rn | head -n 1
+}
+
+recent() { [ -n "$1" ] && [ "$(( $(date +%s) - $1 ))" -lt "$RECENT_SECS" ]; }
+
+slot_recent() {
+	for r in $REPOS; do
+		[ -d "$WS/Agent$1/$r" ] && recent "$(newest_change "$WS/Agent$1/$r")" && return 0
+	done
+	return 1
+}
+
+# Free: no session holds it and it has no uncommitted work under 48 h old.
+slot_free() {
+	[ -d "$WS/Agent$1" ] || return 1
+	[ -z "$(slot_holder "$1")" ] || return 1
+	slot_recent "$1" && return 1
+	return 0
+}
+
+wt_stale() {
+	[ -n "$(git -C "$1" status --porcelain 2>/dev/null)" ] || return 0
+	recent "$(newest_change "$1")" && return 1
+	return 0
+}
+
+max=0
+for d in "$WS"/Agent[0-9]*; do
+	[ -d "$d" ] || continue
+	n="${d##*/Agent}"; case "$n" in *[!0-9]*) continue;; esac
+	[ "$n" -gt "$max" ] && max="$n"
+done
+
+first_free() {
+	n=1
+	while [ "$n" -le "$max" ]; do
+		slot_free "$n" && { printf '%s' "$n"; return 0; }
+		n=$((n + 1))
+	done
+	return 1
+}
+
+if [ "$mode" = prune ]; then
+	say "fetching origin/main…"
+	for r in $REPOS; do git -C "$WS/$r" fetch -q --prune origin 2>/dev/null & done
+	wait
+	plan="$(mktemp)"; co="$(mktemp)"
+
+	n=1
+	while [ "$n" -le "$max" ]; do
+		if slot_free "$n"; then
+			for r in $REPOS; do
+				git -C "$WS/$r" worktree list --porcelain 2>/dev/null |
+					awk '/^worktree /{print $2}' |
+					grep -E "^$WS/Agent$n/" | grep -vxF "$WS/Agent$n/$r" >"$co"
+				while IFS= read -r wt; do
+					[ -n "$wt" ] || continue
+					wt_stale "$wt" && printf 'worktree%s%s%s%s\n' "$TAB" "$r" "$TAB" "$wt" >>"$plan"
+				done <"$co"
+			done
+			slot_dirty "$n" && printf 'reset%s%s\n' "$TAB" "$n" >>"$plan"
+		elif slot_orphaned "$n"; then
+			slot_sessions "$n" | while IFS= read -r os; do
+				printf 'orphan%s%s%s%s\n' "$TAB" "$n" "$TAB" "$os"
+			done >>"$plan"
+		fi
+		n=$((n + 1))
+	done
+
+	for r in $REPOS; do
+		git -C "$WS/$r" worktree list --porcelain 2>/dev/null |
+			awk '/^branch /{sub("refs/heads/","",$2); print $2}' | sort -u >"$co"
+		git -C "$WS/$r" branch --merged origin/main --format '%(refname:short)' 2>/dev/null |
+			grep -vxE 'main|master' | grep -vxFf "$co" |
+			sed "s|^|branch$TAB$r$TAB|" >>"$plan"
+	done
+	rm -f "$co"
+
+	[ -s "$plan" ] || { say "nothing to prune"; rm -f "$plan"; exit 0; }
+	awk -F"$TAB" '
+		$1=="worktree" { printf "  drop worktree  %s\n", $3 }
+		$1=="reset"    { printf "  reset slot     Agent%s (stale uncommitted)\n", $2 }
+		$1=="orphan"   { printf "  end session    %s, holds Agent%s with no agent left\n", $3, $2 }
+		$1=="branch"   { b[$2]++ }
+		END { for (r in b) printf "  merged branch  %s: %d\n", r, b[r] }' "$plan"
+	if [ "$YES" != 1 ]; then
+		say ""
+		say "nothing changed. Apply it with: agent --prune --yes"
+		rm -f "$plan"; exit 0
+	fi
+
+	say ""
+	kept=0
+	while IFS="$TAB" read -r kind a b; do
+		case "$kind" in
+		worktree)
+			if git -C "$WS/$a" worktree remove --force "$b" 2>/dev/null
+			then say "removed $b"
+			else say "! could not remove $b"; kept=$((kept + 1)); fi ;;
+		reset) prep_slot "$a" ;;
+		orphan)
+			if oid="$(sess_id "$b")" && [ -n "$oid" ] && tmux kill-session -t "$oid" 2>/dev/null
+			then say "ended $b (Agent$a released)"
+			else say "! could not end $b"; kept=$((kept + 1)); fi ;;
+		branch)
+			# -d compares with the branch's upstream, so it refuses refs that are in origin/main.
+			if git -C "$WS/$a" branch -d "$b" >/dev/null 2>&1; then
+				:
+			elif git -C "$WS/$a" merge-base --is-ancestor "$b" origin/main 2>/dev/null &&
+				git -C "$WS/$a" branch -D "$b" >/dev/null 2>&1; then
+				:
+			else
+				say "! kept $a/$b (not an ancestor of origin/main)"
+				kept=$((kept + 1))
+			fi ;;
+		esac
+	done <"$plan"
+	say "pruned$( [ "$kept" -gt 0 ] && printf ', %s kept back' "$kept" )"
+	rm -f "$plan"
+	exit 0
+fi
+
+if [ "$mode" = slots ]; then
+	need_ws
+	printf '  %s agent slots (%s):\n\n' "$AGENT_WS_NAME" "$WS"
+	n=1
+	while [ "$n" -le "$max" ]; do
+		h="$(slot_holder "$n")"
+		if [ -n "$h" ] && slot_orphaned "$n"; then
+			st="orphan · $h has no agent left (prefix q, or --prune)"
+		elif [ -n "$h" ]; then st="busy   · held by $h"
+		elif slot_recent "$n"; then st="in use · uncommitted <48h (won't reuse)"
+		elif slot_dirty "$n"; then st="FREE   · stale uncommitted >48h (resets on reuse)"
+		else st="FREE"; fi
+		printf '  Agent%-3s %s\n' "$n" "$st"
+		n=$((n + 1))
+	done
+	free="$(first_free)" && free="$free (reused)" || free="$((max + 1))"
+	printf '\n  next new agent → Agent%s\n' "$free"
+	exit 0
+fi
+
+slot="$(first_free)" || slot=$((max + 1))
+dir="$WS/Agent$slot"
+say "slot → Agent$slot"
+[ "$mode" = dry ] && { say "(dry run: no worktrees created, no agent launched)"; exit 0; }
+
+prep_slot "$slot"
+sess="$(uniq_sess "$AGENT_WS_NAME-a$slot")"
+write_brief "$slot" "$dir" "$sess"
+# Launched from the workspace root, which is the cwd Claude's memory is keyed to.
+launch_session "$WS" "$dir/.agent-brief" "$sess" "$slot"

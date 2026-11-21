@@ -1,0 +1,5 @@
+#!/bin/sh
+s="${XDG_STATE_HOME:-$HOME/.local/state}/agent-sidebar"
+[ -n "${TMUX_PANE:-}" ] && [ -e "$s/posts.jsonl" ] || exit 0
+[ -e "$s/seen/${TMUX_PANE#%}" ] && ! [ "$s/posts.jsonl" -nt "$s/seen/${TMUX_PANE#%}" ] && exit 0
+exec "$HOME/forge/agent-sidebar/bin/agent-board" hook

@@ -1,0 +1,53 @@
+#!/usr/bin/env sh
+# agent-roster [-w]: one line per live agent: the name a peer addresses it by,
+# where it works (its slot and the worktrees on a branch there) and its state.
+#   -w, --what   add the last thing each agent said, read from its transcript
+set -u
+. "$HOME/forge/agent-sidebar/bin/agent-defs"
+
+WHAT=0
+case "${1:-}" in --what | -w) WHAT=1 ;; esac
+WS="$AGENT_WS"
+
+panes="$(tmux list-panes -a -F "#{session_name}$TAB#{pane_pid}$TAB#{pane_current_command}$TAB#{pane_current_path}$TAB#{@pm_slot}" 2>/dev/null |
+	awk -F"$TAB" -v ags="$PM_AGENTS" 'BEGIN{n=split(ags,a," ")}
+		{for(i=1;i<=n;i++) if($3==a[i] && !seen[$1]++) {print; next}}')"
+[ -n "$panes" ] || { printf '  no agents running\n'; exit 0; }
+
+printf '  %-22s %-28s %s\n' 'who' 'where' 'state'
+printf '  %-22s %-28s %s\n' '----------------------' '----------------------------' '-----'
+
+printf '%s\n' "$panes" | while IFS="$TAB" read -r sess ppid cmd path slot; do
+	if [ -n "$slot" ] && [ -d "$WS/Agent$slot" ]; then
+		on=""
+		for g in "$WS/Agent$slot"/*/.git; do
+			[ -f "$g" ] || continue
+			case "$(cat "$(sed -n 's/^gitdir: //p' "$g")/HEAD" 2>/dev/null)" in
+			ref:*) wt="${g%/.git}"; on="$on${on:+, }${wt##*/}" ;;
+			esac
+		done
+		where="a$slot: ${on:-clean}"
+	else
+		where="${path##*/}"
+	fi
+
+	state='running'; cwd="$path"
+	cpid="$(agent_pid_of "$ppid" "$cmd")" || cpid=""
+	if sj="$(agent_state_json "$ppid" "$cmd")"; then
+		state="$(jq -r '
+			(.status // "?") as $s
+			| (((now * 1000) - (.statusUpdatedAt // 0)) / 60000 | floor) as $m
+			| if $m > 0 then "\($s) \($m)m" else $s end' "$sj" 2>/dev/null)"
+		[ -n "$state" ] || state='running'
+		[ "$WHAT" = 1 ] && cwd="$(jq -r '.cwd // empty' "$sj" 2>/dev/null)"
+	fi
+
+	printf '  %-22.22s %-28.28s %s\n' "$sess" "${where:--}" "$state"
+	if [ "$WHAT" = 1 ] && [ -n "$cpid" ]; then
+		said="$("$HOME/forge/agent-sidebar/bin/agent-lastsaid" "$cmd" "$cpid" "${cwd:-$path}" 2>/dev/null)"
+		[ -n "$said" ] && printf '      %.*s\n' "$((${COLUMNS:-120} - 10))" "$said"
+	fi
+done
+
+printf '\n  message one: ListAgents for the live list, then SendMessage to its name.\n'
+printf '  Rarely: a message costs the other agent a turn.\n'

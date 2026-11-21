@@ -1,0 +1,75 @@
+#!/usr/bin/env sh
+# agent-reopen [PANE]: prefix o, the inverse of prefix q. Pick a closed
+# claude conversation and resume it in a tmux session of its own.
+set -u
+. "$HOME/forge/agent-sidebar/bin/agent-defs"
+. "$HOME/forge/agent-sidebar/tmux/fzf-theme.sh"
+CONV="$HOME/forge/agent-sidebar/bin/agent-conversations"
+
+pane="${1:-}"
+[ -n "$pane" ] || pane="$(tmux display-message -p '#{pane_id}' 2>/dev/null)"
+[ -n "$pane" ] || exit 0
+msg() { tmux display-message -d 4000 "$*" 2>/dev/null; }
+
+ppid="$(tmux display-message -p -t "$pane" '#{pane_pid}' 2>/dev/null)"
+project="$(tmux display-message -p -t "$pane" '#{pane_current_path}' 2>/dev/null)"
+args="--dangerously-skip-permissions"
+if f="$(agent_state_json "$ppid" claude)"; then
+	c="$(jq -r '.cwd // empty' "$f" 2>/dev/null)"
+	[ -n "$c" ] && project="$c"
+	cpid="$(agent_pid_of "$ppid" claude)"
+	a="$("$HOME/forge/agent-sidebar/tmux/claude-panes.sh" args "$cpid" 2>/dev/null)"
+	[ -n "$a" ] && args="$a"
+fi
+export PM_REOPEN_PROJECT="$project"
+here="$(printf '%s' "$project" | sed "s|^$HOME|~|")"
+
+out="$("$CONV" list --project "$project" | fzf \
+	--delimiter "$TAB" --with-nth 4 \
+	--border-label "  reopen · $here " \
+	--prompt '  › ' \
+	--header 'enter → its own session   ·   ^a every project   ·   ^p this project' \
+	--preview "$CONV preview {1}" \
+	--preview-window 'right,50%,border-rounded' \
+	--bind "ctrl-a:reload($CONV list --all)+change-border-label(  reopen · every project )" \
+	--bind "ctrl-p:reload($CONV list --project \"\$PM_REOPEN_PROJECT\")+change-border-label(  reopen · $here )")"
+[ -n "$out" ] || exit 0
+
+sid="$(printf '%s' "$out" | cut -f1)"
+cwd="$(printf '%s' "$out" | cut -f2)"
+title="$(printf '%s' "$out" | cut -f3)"
+[ -n "$sid" ] || exit 0
+[ -d "$cwd" ] || { msg "reopen: $cwd no longer exists"; exit 0; }
+
+for s in "$HOME"/.claude/sessions/*.json; do
+	[ "$(jq -r '.sessionId // empty' "$s" 2>/dev/null)" = "$sid" ] || continue
+	p="$(jq -r '.pid // empty' "$s" 2>/dev/null)"
+	[ -n "$p" ] && [ -d "/proc/$p" ] && { msg "reopen: '$title' is already open"; exit 0; }
+done
+
+sess="$(uniq_sess "$(printf '%s' "$title" | tr '.:' '__')")"
+cmd="$(agent_resume_cmd claude "$sid" "$args" "$sess")" ||
+	{ msg "reopen: could not build the resume command"; exit 0; }
+
+set -- $(tmux new-session -d -P -F '#{session_id} #{pane_id}' -s "$(printf '%s' "$sess" | sed 's/#/##/g')" \
+	-n "$(agent_window claude)" -c "$cwd" "$cmd" 2>/dev/null)
+new="${1:-}"; npane="${2:-}"
+[ -n "$new" ] && [ -n "$npane" ] ||
+	{ msg "reopen: could not start the tmux session"; exit 0; }
+tmux set-option -t "$new" @pm_agent claude
+
+printf '\n  reopening %s …\n' "$sess"
+i=0
+while [ "$i" -lt 40 ]; do
+	sleep 0.5
+	npid="$(tmux display-message -p -t "$npane" '#{pane_pid}' 2>/dev/null)"
+	nf="$(agent_state_json "$npid" claude 2>/dev/null)" || { i=$((i + 1)); continue; }
+	if [ "$(jq -r '.sessionId // empty' "$nf" 2>/dev/null)" = "$sid" ]; then
+		cl="$(tmux list-clients -t "$pane" -F '#{client_name}' 2>/dev/null | head -n 1)"
+		[ -n "$cl" ] && tmux switch-client -c "$cl" -t "$new" 2>/dev/null
+		msg "reopened '$sess'"
+		exit 0
+	fi
+	i=$((i + 1))
+done
+msg "reopen: '$sess' started but has not come up, check it"

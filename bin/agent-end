@@ -1,0 +1,25 @@
+#!/usr/bin/env sh
+# agent-end [SESSION]: end an agent's session with no prompt and put its
+# slot, if it holds one, back to origin/main. Uncommitted work in the slot is
+# discarded; branches stay.
+set -u
+. "$HOME/forge/agent-sidebar/bin/agent-defs"
+WS="$AGENT_WS"
+REPOS="$AGENT_WS_REPOS"
+
+sid="$(sess_id "${1:-$(tmux display-message -p '#{session_id}' 2>/dev/null)}")"
+[ -n "$sid" ] || exit 0
+name="$(tmux display-message -p -t "$sid" '#{session_name}' 2>/dev/null)"
+slot="$(tmux show-options -t "$sid" -v -q @pm_slot 2>/dev/null)"
+"$HOME/forge/agent-sidebar/bin/agent-board" done --as "$name" >/dev/null 2>&1
+tmux kill-session -t "$sid" 2>/dev/null
+
+dir="$WS/Agent$slot"
+[ -n "$slot" ] && [ -d "$dir" ] || exit 0
+for r in $REPOS; do
+	wt="$dir/$r"; [ -d "$wt" ] || continue
+	git -C "$wt" checkout -q --detach 2>/dev/null
+	git -C "$wt" reset -q --hard origin/main 2>/dev/null
+	git -C "$wt" clean -qfd 2>/dev/null
+done
+rm -f "$dir/.agent-brief"

@@ -1,0 +1,62 @@
+#!/usr/bin/env sh
+# agent-branch [PANE] [NAME]: fork the claude conversation in a pane into a
+# new tmux session and leave the pane alone. The fork shares the parent's cwd
+# and takes no @pm_slot, so ending it never resets worktrees the parent uses.
+set -u
+. "$HOME/forge/agent-sidebar/bin/agent-defs"
+
+pane="${1:-}"; name="${2:-}"
+[ -n "$pane" ] || pane="$(tmux display-message -p '#{pane_id}' 2>/dev/null)"
+[ -n "$pane" ] || exit 0
+msg() {
+	[ -n "${PM_BRANCH_ECHO:-}" ] && printf '%s\n' "$*"
+	tmux display-message -d 4000 "$*" 2>/dev/null
+}
+
+ppid="$(tmux display-message -p -t "$pane" '#{pane_pid}' 2>/dev/null)"
+f="$(agent_state_json "$ppid" claude)" || { msg "branch: no claude session in this pane"; exit 0; }
+cpid="$(agent_pid_of "$ppid" claude)"
+
+# Mid-turn the transcript on disk stops short of what is on screen.
+case "$(jq -r '.status // empty' "$f" 2>/dev/null)" in
+busy) msg "branch: agent is mid-turn, try again when it is idle"; exit 0 ;;
+esac
+
+sid="$(jq -r '.sessionId // empty' "$f" 2>/dev/null)"
+cwd="$(jq -r '.cwd // empty' "$f" 2>/dev/null)"
+[ -n "$sid" ] || { msg "branch: that session has no id yet"; exit 0; }
+[ -d "$cwd" ] || cwd="$HOME"
+
+parent="$(tmux display-message -p -t "$pane" '#{session_name}' 2>/dev/null)"
+[ -n "$name" ] || name="branch of $parent"
+sess="$(uniq_sess "$name")"
+
+args="$("$HOME/forge/agent-sidebar/tmux/claude-panes.sh" args "$cpid" 2>/dev/null)"
+cmd="$(agent_resume_cmd claude "$sid" "$args" "$sess")" ||
+	{ msg "branch: could not build the resume command"; exit 0; }
+cmd="$cmd --fork-session"
+
+# The pane id comes from the creation: listing panes can return the sidebar first.
+set -- $(tmux new-session -d -P -F '#{session_id} #{pane_id}' -s "$(printf '%s' "$sess" | sed 's/#/##/g')" \
+	-n "$(agent_window claude)" -c "$cwd" "$cmd" 2>/dev/null)
+new="${1:-}"; npane="${2:-}"
+[ -n "$new" ] && [ -n "$npane" ] ||
+	{ msg "branch: could not start the tmux session"; exit 0; }
+tmux set-option -t "$new" @pm_agent claude
+
+i=0
+while [ "$i" -lt 40 ]; do
+	sleep 0.5
+	npid="$(tmux display-message -p -t "$npane" '#{pane_pid}' 2>/dev/null)"
+	nf="$(agent_state_json "$npid" claude 2>/dev/null)" || { i=$((i + 1)); continue; }
+	nsid="$(jq -r '.sessionId // empty' "$nf" 2>/dev/null)"
+	if [ -n "$nsid" ] && [ "$nsid" != "$sid" ]; then
+		# -c: a bare switch-client from a script moves somebody else's screen.
+		cl="$(tmux list-clients -t "$pane" -F '#{client_name}' 2>/dev/null | head -n 1)"
+		[ -n "$cl" ] && tmux switch-client -c "$cl" -t "$new" 2>/dev/null
+		msg "branched into '$sess', $parent keeps running"
+		exit 0
+	fi
+	i=$((i + 1))
+done
+msg "branch: '$sess' started but has not come up, check it"

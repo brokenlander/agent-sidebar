@@ -1,0 +1,120 @@
+#!/usr/bin/env sh
+# The agent registry, sourced by agent, agent-pick, agent-roster and
+# tmux/claude-panes.sh. An agent added here needs a launch command that takes
+# a first prompt and a resume command.
+
+PM_AGENTS="claude opencode codex"
+PM_AGENT_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/agent"
+
+# Optional: a workspace whose repos are checked out once per agent "slot"
+# (Agent1, Agent2, ...), so several agents can work on it side by side.
+# Set per machine, outside any repo, in ~/.config/agent-sidebar/workspace:
+#   AGENT_WS="$HOME/forge/myproject"     # the workspace checkout
+#   AGENT_WS_REPOS="api web helm"         # repos inside it, one worktree each per slot
+#   AGENT_WS_NAME="myproject"             # session names: myproject-a1, -a2, ...
+# Without it there are no slots; agents start in whatever folder you pick.
+# PM_WS / PM_REPOS from older setups are still honoured.
+_ws_conf="${XDG_CONFIG_HOME:-$HOME/.config}/agent-sidebar/workspace"
+[ -r "$_ws_conf" ] && . "$_ws_conf"
+AGENT_WS="${AGENT_WS:-${PM_WS:-}}"
+AGENT_WS_REPOS="${AGENT_WS_REPOS:-${PM_REPOS:-}}"
+[ -n "${AGENT_WS_NAME:-}" ] || AGENT_WS_NAME="$([ -n "$AGENT_WS" ] && basename "$AGENT_WS")"
+TAB="$(printf '\t')"
+
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+agent_valid() {
+	for _a in $PM_AGENTS; do [ "$1" = "$_a" ] && return 0; done
+	return 1
+}
+
+uniq_sess() {
+	_b="$1"; _s="$_b"; _i=2
+	while tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -qxF "$_s"; do
+		_s="$_b-$_i"; _i=$((_i + 1))
+	done
+	printf '%s' "$_s"
+}
+
+# tmux misreads a session name holding a dot as window.pane, so commands target the id.
+sess_id() {  # name or $id -> $id
+	case "$1" in
+	'$'*) printf '%s' "$1" ;;
+	*) tmux list-sessions -F "#{session_id}$TAB#{session_name}" 2>/dev/null |
+		awk -F"$TAB" -v n="$1" '$2==n {print $1; f=1; exit} END {exit !f}' ;;
+	esac
+}
+
+agent_window() {
+	case "$1" in
+	claude) printf 'Cyan' ;;
+	*) printf '%s' "$1" ;;
+	esac
+}
+
+agent_cmd() {  # agent  [brief file]  [display name]
+	_b="${2:-}"; _n="${3:-}"
+	[ -n "$_b" ] && [ -f "$_b" ] || _b=""
+	case "$1" in
+	claude)
+		_c='claude --dangerously-skip-permissions'
+		[ -n "$_n" ] && _c="$_c --name $(shq "$_n")" ;;
+	codex)    _c='codex --dangerously-bypass-approvals-and-sandbox' ;;
+	opencode) _c='opencode' ;;
+	*) return 1 ;;
+	esac
+	if [ -n "$_b" ]; then
+		case "$1" in
+		opencode) _c="$_c --prompt \"\$(cat $(shq "$_b"))\"" ;;
+		*)        _c="$_c \"\$(cat $(shq "$_b"))\"" ;;
+		esac
+	fi
+	printf '%s' "$_c"
+}
+
+# Only claude resumes an exact conversation: opencode continues the newest one
+# for the dir and codex the newest one anywhere.
+agent_resume_cmd() {  # agent  [session id]  [flags]  [display name]
+	_id="${2:-}"; _args="${3:-}"; _n="${4:-}"
+	case "$1" in
+	claude)
+		[ -n "$_id" ] || return 1
+		_c="claude $_args"
+		[ -n "$_n" ] && _c="$_c --name $(shq "$_n")"
+		printf '%s --resume %s' "$_c" "$_id" ;;
+	opencode) printf 'opencode --continue' ;;
+	codex) printf 'codex --dangerously-bypass-approvals-and-sandbox resume --last' ;;
+	*) return 1 ;;
+	esac
+}
+
+agent_last() {
+	_l="$(cat "$PM_AGENT_STATE/last-agent" 2>/dev/null)"
+	agent_valid "$_l" && printf '%s' "$_l" || printf 'claude'
+}
+
+agent_remember() {
+	agent_valid "$1" || return 1
+	mkdir -p "$PM_AGENT_STATE" 2>/dev/null
+	printf '%s\n' "$1" >"$PM_AGENT_STATE/last-agent"
+}
+
+# The pane pid is the agent itself, or the shell that had to expand its brief.
+agent_pid_of() {  # pane pid  agent
+	[ -n "${1:-}" ] && [ -n "${2:-}" ] || return 1
+	for _p in "$1" $(cat "/proc/$1/task/$1/children" 2>/dev/null); do
+		[ "$(cat "/proc/$_p/comm" 2>/dev/null)" = "$2" ] && { printf '%s' "$_p"; return 0; }
+	done
+	return 1
+}
+
+# Claude writes its state file itself; the others go through a sidebar producer.
+agent_state_json() {  # pane pid  agent -> path
+	_p="$(agent_pid_of "${1:-}" "${2:-}")" || return 1
+	case "$2" in
+	claude) _f="$HOME/.claude/sessions/$_p.json" ;;
+	*) _f="${XDG_STATE_HOME:-$HOME/.local/state}/agent-sidebar/agents/$_p.json" ;;
+	esac
+	[ -f "$_f" ] || return 1
+	printf '%s' "$_f"
+}

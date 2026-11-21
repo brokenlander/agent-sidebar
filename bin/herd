@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# herd: run several coding agents side by side in a workspace.
+set -u
+PATH="$HOME/.local/bin:$PATH"
+STATE_LINK="$HOME/.local/state/agent-sidebar"
+STATE_DIR="${HERD_STATE_DIR:-/tmp/agent-sidebar-state}"
+SIDEBAR="$HOME/forge/agent-sidebar"
+BOARD="$HOME/forge/agent-sidebar/bin/agent-board"
+
+usage() {
+	cat <<'USAGE'
+herd                         who is running, and this help
+herd new claude [NAME] [DIR] start a Claude Code agent in DIR (default: here)
+herd new opencode [NAME] [DIR]  the same with OpenCode
+herd go NAME                 switch this terminal to that agent
+herd board                   the board: who holds what, and the notes
+herd end NAME                stop that agent
+herd doctor                  check the install
+
+Keys, after Ctrl-b, the same as on the workstation:
+  a  new agent (then c = Claude Code, o = OpenCode)    u  pick an agent
+  q  end this agent        r  reset it: same folder, new conversation
+  o  reopen an earlier conversation      B  branch this conversation
+  b  board, and b again to go back     e  panel on or off
+  d  scratch terminal     D  step out
+USAGE
+}
+
+state() {
+	mkdir -p "$STATE_DIR" "$(dirname "$STATE_LINK")"
+	[ -L "$STATE_LINK" ] || { [ -e "$STATE_LINK" ] && mv "$STATE_LINK" "$STATE_LINK.old.$$"; ln -s "$STATE_DIR" "$STATE_LINK"; }
+}
+
+server() {
+	state
+	tmux has-session 2>/dev/null || return 0
+	[ "$(tmux show-option -gqv @herd_loaded 2>/dev/null)" = 1 ] || tmux source-file "$HOME/.config/herd/tmux.conf" 2>/dev/null
+	[ "$(tmux show-option -gqv @agent_sidebar_open)" = 1 ] || return 0
+	for w in $(tmux list-windows -a -F '#{window_id}'); do "$SIDEBAR/scripts/ensure.sh" "$w" 2>/dev/null; done
+}
+
+# You asked for an agent in this folder, so Claude Code's "do you trust this
+# folder" question is answered yes for it. Its default answer is "No, exit".
+trust() {
+	python3 - "$1" <<'PY' 2>/dev/null || true
+import json, os, sys
+f = os.path.expanduser("~/.claude.json")
+try:
+    d = json.load(open(f))
+except (OSError, ValueError):
+    d = {}
+p = d.setdefault("projects", {}).setdefault(sys.argv[1], {})
+if not p.get("hasTrustDialogAccepted"):
+    p["hasTrustDialogAccepted"] = True
+    tmp = f + ".herd"
+    json.dump(d, open(tmp, "w"), indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, f)
+PY
+}
+
+go() {
+	tmux has-session -t "=$1" 2>/dev/null || { echo "herd: no agent called $1" >&2; exit 1; }
+	[ -n "${TMUX:-}" ] || exec tmux attach-session -t "=$1"
+	client="${HERD_CLIENT:-}"
+	if [ -z "$client" ] && [ -n "${TMUX_PANE:-}" ]; then
+		here="$(tmux display-message -p -t "$TMUX_PANE" '#{session_id}')"
+		client="$(tmux list-clients -F '#{client_name} #{session_id}' | awk -v s="$here" '$2 == s { print $1; exit }')"
+	fi
+	if [ -n "$client" ]; then tmux switch-client -c "$client" -t "=$1"
+	else echo "open it with: herd go $1"; fi
+}
+
+new() {
+	kind="${1:-}"; name="${2:-}"; dir="${3:-}"; [ -n "$dir" ] || dir="$PWD"
+	extra=""; i=0
+	for a in "$@"; do i=$((i + 1)); [ $i -le 3 ] || extra="$extra $(printf '%q' "$a")"; done
+	case "$kind" in
+	claude) cmd="$(command -v claude || echo "$HOME/.local/bin/claude")" ;;
+	opencode) cmd="$(command -v opencode)" ;;
+	*) echo "herd new claude|opencode [NAME] [DIR]" >&2; exit 2 ;;
+	esac
+	[ -x "$cmd" ] || { echo "herd: $kind is not installed here" >&2; exit 1; }
+	[ -d "$dir" ] || { echo "herd: no such folder: $dir" >&2; exit 1; }
+	if [ -z "$name" ]; then
+		n=1; while tmux has-session -t "=$kind-$n" 2>/dev/null; do n=$((n + 1)); done
+		name="$kind-$n"
+	fi
+	name="$(printf '%s' "$name" | tr -c 'A-Za-z0-9_-' '-')"
+	tmux has-session -t "=$name" 2>/dev/null && { echo "herd: $name is already running (herd go $name)" >&2; exit 1; }
+	server
+	dir="$(cd "$dir" && pwd -P)"
+	[ "$kind" != claude ] || trust "$dir"
+	made="$(tmux new-session -d -P -F '#{session_id} #{pane_id}' -s "$name" -c "$dir" "'$cmd'$extra")" || exit 1
+	sid="${made% *}"; pane="${made#* }"
+	tmux set-option -t "$sid" @herd 1
+	tmux set-option -t "$sid" @herd_cmd "'$cmd'"
+	tmux set-option -t "$sid" @herd_pane "$pane"
+	# The session ends with its agent, not with the panel beside it.
+	tmux set-hook -t "$sid" pane-exited "if -F '#{==:#{hook_pane},$pane}' 'kill-session -t \\$sid'"
+	"$SIDEBAR/agent-sidebar" --panes
+	echo "started $name ($kind) in $dir"
+	[ "${HERD_STAY:-}" = 1 ] || go "$name"
+}
+
+# The pane the agent runs in, given any pane of its window.
+agent_pane() {
+	tmux list-panes -t "$1" -F '#{pane_id} #{pane_current_command}' | awk '$2 != "agent-sidebar" { print $1; exit }'
+}
+
+# The pane running an agent in this session, Herd's or not.
+agent_in() {
+	p="$(tmux show-options -t "$1" -qv @herd_pane)"
+	[ -n "$p" ] && tmux display-message -p -t "$p" '#{pane_id}' >/dev/null 2>&1 && { echo "$p"; return; }
+	tmux list-panes -s -t "$1" -F '#{pane_id} #{pane_current_command}' | awk '$2 == "claude" || $2 == "opencode" { print $1; exit }'
+}
+
+herd_session() {
+	[ -n "$(agent_in "$1")" ] && return 0
+	tmux display-message -t "$1" " no agent runs here" 2>/dev/null
+	return 1
+}
+
+# Ctrl-b q: end the agent in this session, no question asked. A workspace tab
+# ended this way comes back fresh the next time the tab is opened.
+endhere() {
+	herd_session "$1" || return 0
+	tmux kill-session -t "$1"
+}
+
+# Ctrl-b r: same agent, same folder, new conversation.
+reset() {
+	herd_session "$1" || return 0
+	pane="$(agent_in "$1")"
+	cmd="$(tmux show-options -t "$1" -qv @herd_cmd)"
+	[ -n "$cmd" ] || cmd="'$(command -v "$(tmux display-message -p -t "$pane" '#{pane_current_command}')")'"
+	tmux respawn-pane -k -t "$pane" "$cmd"
+}
+
+# Ctrl-b o: bring back an earlier conversation, in a new agent.
+reopen() {
+	case "$1" in
+	claude) new claude "" "$2" --resume ;;
+	opencode) new opencode "" "$2" --continue ;;
+	esac
+}
+
+# Ctrl-b B: a copy of this conversation in its own agent. Claude Code only.
+branch() {
+	pane="$(agent_pane "$1")"
+	pid="$(tmux display-message -p -t "$pane" '#{pane_pid}')"
+	id=""
+	for p in $pid $(pgrep -P "$pid" 2>/dev/null); do
+		f="$HOME/.claude/sessions/$p.json"
+		[ -f "$f" ] && id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("sessionId",""))' "$f")" && break
+	done
+	if [ -z "$id" ]; then
+		tmux display-message -t "$pane" " branch works for a Claude Code agent that has said something"
+		return 0
+	fi
+	new claude "" "$(tmux display-message -p -t "$pane" '#{pane_current_path}')" --resume "$id" --fork-session
+}
+
+# Ctrl-b a: choose the folder for a new agent. Enter takes the highlighted one;
+# typing narrows the list, and a path that is not listed can be typed in full.
+pick() {
+	kind="$1"; here="${2:-$PWD}"
+	choice="$({
+		printf '%s\n' "$here"
+		find "$HOME/projects" -mindepth 1 -maxdepth 2 -type d -not -path '*/.*' 2>/dev/null | sort
+		printf '%s\n' "$HOME"
+	} | awk '!seen[$0]++' | fzf --prompt="$kind in > " --header='folder for the new agent' --print-query --height=100% --reverse | tail -1)"
+	[ -n "$choice" ] || exit 0
+	choice="${choice/#\~/$HOME}"
+	HERD_STAY= new "$kind" "" "$choice"
+}
+
+doctor() {
+	ok=0
+	check() { if eval "$2" >/dev/null 2>&1; then printf '  ok    %s\n' "$1"; else printf '  FAIL  %s\n' "$1"; ok=1; fi; }
+	state
+	check "state folder is on local disk" '[ -L "$STATE_LINK" ] && [ -d "$STATE_DIR" ] && [ "$(stat -f -c %T "$STATE_DIR")" != nfs ]'
+	check "sidebar binary runs" '"$SIDEBAR/agent-sidebar" --help 2>&1 | grep -q agent-sidebar'
+	check "board runs" '"$BOARD" --help'
+	check "tmux config in place" 'grep -qF herd/tmux.conf "$HOME/.tmux.conf" && [ -s "$HOME/.config/herd/tmux.conf" ]'
+	check "OpenCode plugin linked" '[ -e "$HOME/.config/opencode/plugins/agent-sidebar.js" ]'
+	check "Claude Code hooks set" 'grep -q "agent-board" "$HOME/.claude/settings.json"'
+	check "claude installed" 'command -v claude || [ -x "$HOME/.local/bin/claude" ]'
+	check "opencode installed" 'command -v opencode'
+	return $ok
+}
+
+case "${1:-}" in
+"") server; "$HOME/forge/agent-sidebar/bin/agent-roster"; echo; usage ;;
+new) shift; new "$@" ;;
+go) [ -n "${2:-}" ] || { usage; exit 2; }; go "$2" ;;
+ls) server; "$HOME/forge/agent-sidebar/bin/agent-roster" ;;
+board) server; if [ -n "${TMUX:-}" ]; then "$BOARD" open; else "$BOARD"; fi ;;
+end) [ -n "${2:-}" ] || { usage; exit 2; }; tmux kill-session -t "=$2" && "$SIDEBAR/agent-sidebar" --panes && echo "ended $2" ;;
+pick) pick "${2:-}" "${3:-}" ;;
+endhere) endhere "${2:-}" ;;
+reset) reset "${2:-}" "${3:-}" ;;
+reopen) reopen "${2:-}" "${3:-$PWD}" ;;
+branch) branch "${2:-}" ;;
+doctor) doctor ;;
+-h | --help | help) usage ;;
+*) usage; exit 2 ;;
+esac

@@ -1,0 +1,2352 @@
+#!/usr/bin/env python3
+"""agent-board — the fleet's quiet channel: who is working on what, and notes that can wait.
+
+Say what you are working on. It stays up while you keep working and lapses
+about two hours after you stop:
+  agent-board claim [PATH...] --what "one line"   set or update your status; paths warn others off
+  agent-board claim                               renew it as it is
+  agent-board done [PATH...]                      release those paths, or clear your status
+  agent-board guard PATH                          exit 2 and say who, if another agent holds it
+
+Before a release, a pin move or a prod sync, take its hold. Nobody else can
+while you have it, so there is nothing to announce:
+  agent-board hold NAME... --what "one line"      take it, or exit 2 and say who has it
+  agent-board free [NAME...]                      give it back; whoever was stopped is told
+  agent-board holds [NAME...]                     list them; exit 2 if another agent holds one
+  --pid N on hold ties it to that process: it frees itself when the process ends (release.sh does this)
+  Names are yours to pick and shared by habit: api, web, db, prod; all stops everything.
+
+Leave a note. Addressed notes reach the agent by themselves after its next tool call:
+  agent-board post "TEXT" --to NAME               to one agent, by name or slot (a7); repeat --to for more
+  agent-board post "TEXT" --path PATH             to whoever holds that path
+  agent-board post "TEXT"                         to everyone: rare, at most 3 an hour
+  --wake on a post wakes an idle OpenCode addressee with the note
+  agent-board reply ID "TEXT"                     answer in a thread
+  agent-board read [--all]                        notes for you, and notes to everyone
+
+  agent-board                                     your briefing: your status, notes waiting,
+                                               clashes with you, who is on what
+  agent-board watch | open [SESSION]              the full page, and its window (prefix b)
+
+  --as NAME   act as that tmux session instead of the one this runs in
+"""
+import fcntl
+import json
+import os
+import re
+import select
+import signal
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+import unicodedata
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+STATE = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local" / "state") / "agent-sidebar"
+CFG = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
+BOARD = STATE / "board.jsonl"
+LOG = STATE / "board.log"
+LOCK = STATE / "board.lock"
+POSTS = STATE / "posts.jsonl"
+POSTS_LOG = STATE / "posts.log"
+SEEN = STATE / "seen"
+GITCACHE = STATE / "board-git.json"
+GITLOCK = STATE / "board-git.lock"
+HOLDS = STATE / "holds.jsonl"
+def _ws_config():
+    """The optional workspace from ~/.config/agent-sidebar/workspace (see agent-defs)."""
+    vals = {}
+    conf = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "agent-sidebar" / "workspace"
+    try:
+        for line in conf.read_text().splitlines():
+            m = re.match(r"\s*(AGENT_WS|AGENT_WS_REPOS|AGENT_WS_NAME)=(.*)", line)
+            if m:
+                v = m.group(2).split(" #")[0].strip().strip("\"'")
+                vals[m.group(1)] = os.path.expanduser(os.path.expandvars(v))
+    except OSError:
+        pass
+    return vals
+
+
+_WSC = _ws_config()
+_WS_PATH = os.environ.get("AGENT_WS") or _WSC.get("AGENT_WS") or os.environ.get("PM_WS") or ""
+# No workspace: a path that never exists, so nothing matches it.
+WS = Path(_WS_PATH) if _WS_PATH else HOME / ".agent-sidebar-no-workspace"
+FORGE = HOME / "forge"
+SELF = str(Path(__file__).resolve())
+KINDS = ("claude", "opencode", "codex")
+
+DEFAULT_TTL = 2 * 3600
+HOLD_REMIND = 30 * 60
+RECENT = 24 * 3600
+SLOT_REPOS = set((os.environ.get("AGENT_WS_REPOS") or _WSC.get("AGENT_WS_REPOS") or os.environ.get("PM_REPOS") or "").split())
+GONE_GRACE = 300
+STALE_STATUS = 90 * 60
+POST_TTL = 24 * 3600
+POST_MAX = 600
+BROADCASTS_PER_HOUR = 3
+HISTORY_DAYS = 7
+GIT_EVERY = 20
+BRIEF = "Session bootstrap"
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+TEXT = "\033[38;2;169;177;214m"
+WHITE = "\033[38;2;232;236;250m"
+NAME = "\033[38;2;145;180;250m"
+HEAD = "\033[38;2;122;162;247m"
+CYAN = "\033[38;2;125;207;255m"
+TEAL = "\033[38;2;115;218;202m"
+DIM = "\033[38;2;86;95;137m"
+FAINT = "\033[38;2;65;72;104m"
+BORDER = "\033[38;2;59;66;97m"
+GREEN = "\033[38;2;158;206;106m"
+RED = "\033[38;2;247;118;142m"
+AMBER = "\033[38;2;224;175;104m"
+PURPLE = "\033[38;2;215;166;255m"
+BLUE = "\033[38;2;61;89;161m"
+STATE_COLOUR = {"asking": PURPLE, "waiting": AMBER, "idle": GREEN, "working": RED}
+BRANCH = ""
+
+
+def die(msg, code=1):
+    print(f"agent-board: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+_reach = None
+
+
+def tmux_reachable():
+    global _reach
+    if _reach is None:
+        _reach = subprocess.run(["tmux", "list-sessions", "-F", ""], capture_output=True).returncode == 0
+    return _reach
+
+
+def pane_map():
+    sock = os.path.basename(os.environ.get("TMUX", "").split(",")[0]) or "default"
+    try:
+        rows = [l.split("\t") for l in (STATE / f"panes-{sock}").read_text().splitlines()]
+    except OSError:
+        return []
+    return [r for r in rows if len(r) >= 4]
+
+
+def pid_tty(pid):
+    try:
+        nr = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[4])
+    except (OSError, ValueError, IndexError):
+        return ""
+    return f"/dev/pts/{nr & 0xff | (nr >> 12 & 0xfff00)}" if nr >> 8 & 0xfff in range(136, 144) else ""
+
+
+def mapped_rows():
+    by_tty = {r[0]: r for r in pane_map()}
+    rows = []
+    for f in list((CFG / "sessions").glob("*.json")) + list((STATE / "agents").glob("*.json")):
+        pid = f.name.split(".")[0]
+        r = by_tty.get(pid_tty(pid)) if pid.isdigit() else None
+        if r:
+            rows.append("\t".join((r[3], r[1], pid, r[2], "")))
+    return rows
+
+
+def map_answer(args):
+    fmt = args[-1] if args else ""
+    target = args[args.index("-t") + 1] if "-t" in args and args.index("-t") + 1 < len(args) else ""
+    panes = pane_map()
+    if args[:1] == ("list-panes",) and fmt == "#{pane_id}":
+        return "\n".join(r[2] for r in panes)
+    row = next((r for r in panes if target in (r[2], r[1], r[3], r[3] + ":")), None)
+    if row and args[:1] == ("display-message",):
+        return {"#{session_name}": row[3], "#{session_id}": row[1]}.get(fmt, "")
+    return ""
+
+
+def tmux(*args):
+    r = subprocess.run(["tmux", *args], capture_output=True, text=True)
+    if r.returncode == 0:
+        return r.stdout.strip()
+    return "" if tmux_reachable() else map_answer(args)
+
+
+def take(argv, flag):
+    if flag not in argv:
+        return None
+    i = argv.index(flag)
+    if i + 1 >= len(argv):
+        die(f"{flag} needs a value")
+    v = argv.pop(i + 1)
+    argv.pop(i)
+    return v
+
+
+def age(secs):
+    s = max(0, int(secs))
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= n:
+            return f"{s // n}{unit}"
+    return f"{s}s"
+
+
+def ago(ts):
+    return age(time.time() - ts) if ts else "-"
+
+
+def iso_ts(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return 0
+
+
+def rel(a):
+    for root, prefix in ((str(WS), ""), (str(FORGE), ""), (str(HOME), "~/")):
+        if a.startswith(root + "/"):
+            r = a[len(root) + 1:]
+            if root == str(WS):
+                r = re.sub(r"^Agent\d+(/|$)", "", r)
+            return prefix + r if r else os.path.basename(root)
+    return a
+
+
+def depth(a):
+    parts = a.split("/")
+    for n in range(len(parts), 0, -1):
+        if os.path.exists("/".join(parts[:n]) or "/"):
+            return n - len(parts)
+    return -len(parts)
+
+
+def norm(p):
+    p = os.path.expanduser(p)
+    cwd = os.getcwd()
+    if os.path.isabs(p):
+        return rel(os.path.normpath(p))
+    bases = [cwd]
+    m = re.match(re.escape(str(WS)) + r"/Agent\d+", cwd)
+    if m:
+        bases.append(m.group(0))
+    bases += [str(WS), str(FORGE), str(HOME)]
+    return rel(max((os.path.normpath(os.path.join(b, p)) for b in bases), key=depth))
+
+
+def whole_repo(p):
+    return p in SLOT_REPOS
+
+
+def overlaps(a, b):
+    return a == b or a.startswith(b.rstrip("/") + "/") or b.startswith(a.rstrip("/") + "/")
+
+
+def clash(a, b):
+    return overlaps(a, b) and (a == b or not (whole_repo(a) or whole_repo(b)))
+
+
+def under(key, path):
+    return key == path or key.startswith(path.rstrip("/") + "/")
+
+
+def load_json(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def name_list(fname):
+    try:
+        return {l.strip() for l in (STATE / fname).read_text().splitlines() if l.strip()}
+    except OSError:
+        return set()
+
+
+def comm(pid):
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return ""
+
+
+def agent_proc(pane_pid):
+    if comm(pane_pid) in KINDS:
+        return pane_pid, comm(pane_pid)
+    try:
+        kids = Path(f"/proc/{pane_pid}/task/{pane_pid}/children").read_text().split()
+    except OSError:
+        return None, None
+    for k in kids:
+        if comm(k) in KINDS:
+            return int(k), comm(k)
+    return None, None
+
+
+def sessions():
+    out = subprocess.run(["tmux", "list-sessions", "-F", "#{session_id}\t#{session_name}"],
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        return None if tmux_reachable() else {r[1]: r[3] for r in pane_map()}
+    return dict(l.split("\t", 1) for l in out.stdout.splitlines() if "\t" in l)
+
+
+def fleet(idle_wait=1800):
+    fmt = "\t".join(("#{session_name}", "#{session_id}", "#{pane_pid}", "#{pane_id}", "#{@pm_slot}"))
+    listed = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt], capture_output=True, text=True)
+    rows = listed.stdout.splitlines() if listed.returncode == 0 or tmux_reachable() else mapped_rows()
+    parked, frozen = name_list("parked"), name_list("frozen")
+    now = time.time()
+    agents, seen = [], set()
+    for row in rows:
+        f = row.split("\t")
+        if len(f) < 5 or f[0] in seen or not f[2].isdigit():
+            continue
+        pid, kind = agent_proc(int(f[2]))
+        if not pid:
+            continue
+        seen.add(f[0])
+        st = load_json(CFG / "sessions" / f"{pid}.json") if kind == "claude" \
+            else load_json(STATE / "agents" / f"{pid}.json")
+        raw = st.get("status", "")
+        last = max(st.get("statusUpdatedAt") or 0, st.get("updatedAt") or 0) / 1000
+        if raw in ("waiting", "blocked"):
+            state = "asking"
+        elif raw in ("busy", "working"):
+            state = "working"
+        elif raw in ("idle", "shell"):
+            state = "waiting" if idle_wait and last and now - last >= idle_wait else "idle"
+        else:
+            state = "unknown"
+        agents.append({"name": f[0], "sid": f[1], "pane": f[3], "slot": f[4], "kind": kind, "pid": pid,
+                       "state": state, "seen": (st.get("statusUpdatedAt") or 0) / 1000,
+                       "active": now if state == "working" else last, "cwd": st.get("cwd", ""),
+                       "cname": st.get("name", ""), "session_id": st.get("sessionId", ""),
+                       "parked": f[0] in parked, "frozen": f[0] in frozen, "said": {}})
+    return agents
+
+
+def whoami(argv):
+    name = take(argv, "--as")
+    if name is None:
+        pane = os.environ.get("TMUX_PANE")
+        if not pane:
+            die("not in a tmux pane; pass --as NAME")
+        name = tmux("display-message", "-p", "-t", pane, "#{session_name}")
+        if not name:
+            die("cannot read this pane's tmux session")
+    sid = tmux("display-message", "-p", "-t", f"{name}:", "#{session_id}")
+    slot = tmux("show-options", "-t", sid or name, "-v", "-q", "@pm_slot")
+    return name, slot, sid
+
+
+def resolve(names):
+    live = sessions() or {}
+    by_name = {n: s for s, n in live.items()}
+    agents = fleet(0)
+    claude = {a["cname"]: a for a in agents if a["cname"]}
+    slots = {a["slot"]: a for a in agents if a["slot"]}
+    out, unknown = [], []
+    for n in names:
+        m = re.fullmatch(r"(?:a|Agent)(\d+)", n)
+        if n in by_name:
+            out.append((n, by_name[n]))
+        elif n in claude:
+            out.append((claude[n]["name"], claude[n]["sid"]))
+        elif m and m.group(1) in slots:
+            out.append((slots[m.group(1)]["name"], slots[m.group(1)]["sid"]))
+        elif n.lower() in ("all", "everyone"):
+            die("a post with no --to goes to everyone")
+        else:
+            unknown.append(n)
+    if unknown:
+        die(f"no live agent called {', '.join(unknown)}. Live: {', '.join(sorted(by_name))}")
+    working = {a["name"] for a in agents if a["state"] == "working"}
+    return out, [n for n, _ in out if n not in working]
+
+
+class locked:
+    def __enter__(self):
+        STATE.mkdir(parents=True, exist_ok=True)
+        self.fh = open(LOCK, "w")
+        fcntl.flock(self.fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+
+
+def read_jsonl(path, key):
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get(key):
+            out.append(r)
+    return out
+
+
+def write_jsonl(path, recs):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in recs))
+    os.replace(tmp, path)
+
+
+def append_jsonl(path, recs):
+    if recs:
+        with open(path, "a") as fh:
+            for r in recs:
+                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def read():
+    return read_jsonl(BOARD, "agent")
+
+
+def activity(agents):
+    return {a["name"]: a["active"] for a in agents}
+
+
+def running(r):
+    return bool(r.get("pid")) and os.path.exists(f"/proc/{r['pid']}")
+
+
+def lapses(r, act):
+    if running(r):
+        return float("inf")
+    return max(r.get("ts", 0), act.get(r["agent"], 0)) + r.get("ttl", DEFAULT_TTL)
+
+
+def follow_renames(recs, live):
+    for r in recs:
+        if r.get("sid") and live and r["sid"] in live and live[r["sid"]] != r["agent"]:
+            r["agent"] = live[r["sid"]]
+
+
+def sweep(recs, now, agents):
+    live = sessions()
+    follow_renames(recs, live)
+    names = set(live.values()) if live is not None else None
+    act = activity(agents)
+    keep, gone = [], []
+    for r in recs:
+        if now > lapses(r, act):
+            gone.append({**r, "ended": now, "why": "expired"})
+            continue
+        if names is not None and r["agent"] not in names:
+            r.setdefault("gone", now)
+            if now - r["gone"] > GONE_GRACE:
+                gone.append({**r, "ended": now, "why": "gone"})
+                continue
+        else:
+            r.pop("gone", None)
+        keep.append(r)
+    append_jsonl(LOG, gone)
+    return keep, gone
+
+
+def compact(recs, now, agents):
+    return sweep(recs, now, agents)[0]
+
+
+def visible(recs, now, agents=None):
+    live = sessions()
+    follow_renames(recs, live)
+    names = set(live.values()) if live is not None else None
+    act = activity(agents if agents is not None else fleet(0))
+    return [r for r in recs if now <= lapses(r, act) and (names is None or r["agent"] in names)]
+
+
+def label(r):
+    return f"{r['agent']} (a{r['slot']})" if r.get("slot") else r["agent"]
+
+
+def clashes(recs):
+    hit = {}
+    for r in recs:
+        for p in r.get("paths", []):
+            for o in recs:
+                if o is r:
+                    continue
+                for q in o.get("paths", []):
+                    if clash(p, q):
+                        hit.setdefault((r["agent"], p), []).append((o, q))
+    return hit
+
+
+def read_holds():
+    return read_jsonl(HOLDS, "name")
+
+
+def live_holds(now, agents=None):
+    holds = [h for h in read_holds() if not h.get("pid") or running(h)]
+    return visible(holds, now, agents) if holds else []
+
+
+def hold_line(h, now, me=None):
+    who = "you" if h["agent"] == me else label(h)
+    return f"{h['name']}  held by {who} for {age(now - h.get('since', now))}" + (f": {h['what']}" if h.get("what") else "")
+
+
+def blocks(h, me, names, pid=None):
+    if h["name"] not in names and "all" not in (h["name"], *names):
+        return False
+    return h["agent"] != me or bool(pid and h.get("pid") and h["pid"] != pid)
+
+
+def new_id(posts):
+    ids = {p["id"] for p in posts}
+    while True:
+        i = os.urandom(3).hex()[:5]
+        if i not in ids:
+            return i
+
+
+def tell_waiters(h, why, now):
+    to = [w for w in h.get("waiters", []) if w["name"] != h["agent"]]
+    if not to:
+        return []
+    posts = expire_posts(now)
+    posts.append({"id": new_id(posts), "from": h["agent"], "from_sid": h.get("sid", ""), "slot": h.get("slot", ""),
+                  "to": [w["name"] for w in to], "to_sid": [w["sid"] for w in to], "paths": [], "re": "",
+                  "text": f"{h['name']} is free: {why}. Take it with agent-board hold {h['name']} before you go on.",
+                  "ts": now, "seen": {}})
+    write_jsonl(POSTS, posts)
+    return [w["name"] for w in to]
+
+
+ENDED = {"expired": "{} stopped working and its hold lapsed", "gone": "{}'s session ended", "exited": "{}'s run ended"}
+
+
+def sweep_holds(now, agents):
+    holds, gone = sweep(read_holds(), now, agents)
+    dead = [{**h, "ended": now, "why": "exited"} for h in holds if h.get("pid") and not running(h)]
+    append_jsonl(LOG, dead)
+    holds = [h for h in holds if not h.get("pid") or running(h)]
+    for h in gone + dead:
+        tell_waiters(h, ENDED[h["why"]].format(h["agent"]), now)
+    if gone or dead:
+        write_jsonl(HOLDS, holds)
+    return holds
+
+
+def release(holds, mine, now):
+    told = []
+    for h in mine:
+        holds.remove(h)
+        told += tell_waiters(h, f"{h['agent']} released it", now)
+    append_jsonl(LOG, [{**h, "ended": now, "why": "freed"} for h in mine])
+    write_jsonl(HOLDS, holds)
+    return sorted(set(told))
+
+
+def hold_names(argv):
+    return [n for n in (re.sub(r"[^a-z0-9._-]+", "-", a.lower()).strip("-") for a in argv) if n]
+
+
+def cmd_hold(argv):
+    me, slot, sid = whoami(argv)
+    what = take(argv, "--what")
+    pid = int(take(argv, "--pid") or 0)
+    names = hold_names(argv)
+    if not names:
+        die('hold what? agent-board hold NAME --what "one line" (agent-board holds lists them)')
+    now = int(time.time())
+    agents = fleet(0)
+    with locked():
+        holds = sweep_holds(now, agents)
+        block = [h for h in holds if blocks(h, me, names, pid)]
+        if block:
+            for h in block:
+                if not any(w["name"] == me for w in h.setdefault("waiters", [])):
+                    h["waiters"].append({"name": me, "sid": sid})
+            write_jsonl(HOLDS, holds)
+        else:
+            for n in names:
+                h = next((x for x in holds if x["name"] == n), None)
+                if h is None:
+                    h = {"name": n, "agent": me, "what": "", "since": now, "waiters": [], **({"pid": pid} if pid else {})}
+                    holds.append(h)
+                h.update(sid=sid, slot=slot, ts=now)
+                if what is not None and not (pid and h.get("pid") != pid):
+                    h["what"] = " ".join(what.split())
+            write_jsonl(HOLDS, holds)
+    if block:
+        print("not taken:")
+        for h in block:
+            print("  " + hold_line(h, now, me) + (f" (process {h['pid']} is still running)" if h["agent"] == me else ""))
+        print("Do not go ahead. A note reaches you when it is free; take the hold then.")
+        sys.exit(2)
+    print(f"you hold {', '.join(names)}. Nobody else can take {'it' if len(names) == 1 else 'them'} until: "
+          f"agent-board free {' '.join(names)}")
+    print(f"a hold lapses {age(DEFAULT_TTL)} after you stop working; agent-board done frees it too")
+
+
+def cmd_free(argv):
+    me, _, _ = whoami(argv)
+    pid = int(take(argv, "--pid") or 0)
+    names = hold_names(argv)
+    now = int(time.time())
+    with locked():
+        holds = sweep_holds(now, fleet(0))
+        have = [h for h in holds if h["agent"] == me and (not pid or h.get("pid") == pid)]
+        if pid and not have:
+            return
+        missing = [n for n in names if n not in {h["name"] for h in have}]
+        if missing or not have:
+            die(f"you do not hold {', '.join(missing) or 'anything'}; you hold "
+                f"{', '.join(h['name'] for h in have) or 'nothing'} (a hold lapses {age(DEFAULT_TTL)} after you stop working)")
+        mine = [h for h in have if not names or h["name"] in names]
+        told = release(holds, mine, now)
+    print(f"freed {', '.join(h['name'] for h in mine)}" + (f"; {', '.join(told)} told" if told else ""))
+
+
+def cmd_holds(argv):
+    me = take(argv, "--as")
+    if me is None and os.environ.get("TMUX_PANE"):
+        me = tmux("display-message", "-p", "-t", os.environ["TMUX_PANE"], "#{session_name}")
+    names = hold_names(argv)
+    now = int(time.time())
+    holds = live_holds(now)
+    for h in holds:
+        print(hold_line(h, now, me))
+    if not holds:
+        print("no holds")
+    if any(blocks(h, me, names) for h in holds):
+        sys.exit(2)
+
+
+def cmd_claim(argv):
+    me, slot, sid = whoami(argv)
+    what = take(argv, "--what")
+    paths = [norm(p) for p in argv if p]
+    now = int(time.time())
+    agents = fleet(0)
+    with locked():
+        recs = compact(read(), now, agents)
+        mine = next((r for r in recs if r["agent"] == me), None)
+        if mine is None and not paths and what is None:
+            die('nothing to renew. Say what you are on: agent-board claim [PATH...] --what "one line"')
+        if mine is None:
+            mine = {"agent": me, "sid": sid, "slot": slot, "paths": [], "what": "", "since": now, "what_ts": now}
+            recs.append(mine)
+        mine.update(sid=sid, slot=slot, ts=now)
+        for p in paths:
+            if p not in mine["paths"]:
+                mine["paths"].append(p)
+        if what is not None:
+            mine["what"] = " ".join(what.split())
+            mine["what_ts"] = now
+            mine.pop("reminded", None)
+        write_jsonl(BOARD, recs)
+        others = visible(recs, now, agents)
+    on = mine["what"] or "(no sentence; add one with --what)"
+    held = f"; holding {', '.join(mine['paths'])}" if mine["paths"] else ""
+    print(f"on the board as {label(mine)}: {on}{held}")
+    print(f"it stays up while you work and lapses {age(DEFAULT_TTL)} after you stop; agent-board done clears it")
+    wide = [p for p in paths if whole_repo(p)]
+    if wide:
+        print(f"  {', '.join(wide)}: a whole repo warns nobody off. Name the directories you will change "
+              "and an overlap is caught.")
+    hit = {k: v for k, v in clashes(others).items() if k[0] == me}
+    for (_, p), held_by in hit.items():
+        for o, q in held_by:
+            note = f": {o['what']}" if o.get("what") else ""
+            print(f"  ! {p} overlaps {q}, held by {label(o)} for {age(now - o.get('since', now))}{note}")
+    if hit:
+        print("  your claim is recorded; settle it with them before you edit (agent-board post --to NAME)")
+        sys.exit(2)
+
+
+def cmd_done(argv):
+    me, _, _ = whoami(argv)
+    args = [p for p in argv if p]
+    now = int(time.time())
+    with locked():
+        recs = compact(read(), now, fleet(0))
+        mine = next((r for r in recs if r["agent"] == me), None)
+        if mine is None:
+            print(f"nothing on the board for {me}")
+            return
+        paths = [h for a in args for h in mine["paths"] if h in (a.rstrip("/"), norm(a))]
+        missing = [a for a in args if not any(h in (a.rstrip("/"), norm(a)) for h in mine["paths"])]
+        if missing:
+            die(f"you do not hold {', '.join(missing)}; you hold {', '.join(mine['paths']) or 'no paths'}")
+        if paths:
+            mine["paths"] = [p for p in mine["paths"] if p not in paths]
+            mine["ts"] = now
+        if not paths or not (mine["paths"] or mine.get("what")):
+            recs.remove(mine)
+            append_jsonl(LOG, [{**mine, "ended": now, "why": "done"}])
+            print(f"cleared {me} from the board")
+            holds = sweep_holds(now, fleet(0))
+            have = [h for h in holds if h["agent"] == me and not running(h)]
+            if have:
+                release(holds, have, now)
+                print(f"freed {', '.join(h['name'] for h in have)}")
+        else:
+            print(f"released {', '.join(paths)}; still holding {', '.join(mine['paths']) or 'nothing'}")
+        write_jsonl(BOARD, recs)
+
+
+def read_posts():
+    return read_jsonl(POSTS, "id")
+
+
+def threads(posts):
+    roots = {p["id"]: [p] for p in posts if not p.get("re")}
+    for p in posts:
+        if p.get("re") in roots:
+            roots[p["re"]].append(p)
+    return roots
+
+
+def live_posts(posts, now):
+    keep = []
+    for thread in threads(posts).values():
+        if now - max(p["ts"] for p in thread) <= POST_TTL:
+            keep.extend(thread)
+    return keep
+
+
+def expire_posts(now):
+    posts = read_posts()
+    live = live_posts(posts, now)
+    if len(live) != len(posts):
+        keep = {id(p) for p in live}
+        append_jsonl(POSTS_LOG, [{**p, "ended": now} for p in posts if id(p) not in keep])
+        write_jsonl(POSTS, live)
+    return live
+
+
+def broadcast(p):
+    return not p.get("to") and not p.get("paths") and not p.get("re")
+
+
+def is_me(name, sid, me, me_sid):
+    return name == me or (sid and sid == me_sid)
+
+
+def for_me(p, me, me_sid, thread, claimed):
+    if is_me(p["from"], p.get("from_sid"), me, me_sid):
+        return False
+    if me in p.get("to", []) or (me_sid and me_sid in p.get("to_sid", [])):
+        return True
+    if p.get("re") and any(is_me(q["from"], q.get("from_sid"), me, me_sid) for q in thread):
+        return True
+    return any(overlaps(a, b) for a in p.get("paths", []) for b in claimed)
+
+
+def seen_by(p, me):
+    return me in p.get("seen", {})
+
+
+def addressee(p):
+    bits = []
+    if p.get("to"):
+        bits.append(", ".join(p["to"]))
+    if p.get("paths"):
+        bits.append("whoever holds " + ", ".join(p["paths"]))
+    return " and ".join(bits) if bits else "everyone"
+
+
+def my_claims(me, now, agents=None):
+    return [q for r in visible(read(), now, agents) if r["agent"] == me for q in r.get("paths", [])]
+
+
+def cmd_post(argv, reply_to=None):
+    me, slot, sid = whoami(argv)
+    wake = "--wake" in argv
+    if wake:
+        argv.remove("--wake")
+    to = []
+    while "--to" in argv:
+        to.append(take(argv, "--to"))
+    paths = []
+    while "--path" in argv:
+        paths.append(norm(take(argv, "--path")))
+    re_id = reply_to or take(argv, "--re")
+    text = " ".join(" ".join(argv).split())
+    if not text:
+        die('post what? agent-board post "one short note" --to NAME (or --path PATH)')
+    if len(text) > POST_MAX:
+        die(f"a post is a note, not a document: {len(text)} characters, the limit is {POST_MAX}. "
+            "Put the detail in a file and post its path.")
+    targets, idle = resolve(to) if to else ([], [])
+    now = int(time.time())
+    with locked():
+        posts = expire_posts(now)
+        if re_id:
+            parent = next((p for p in posts if p["id"] == re_id), None)
+            if parent is None:
+                die(f"no live post {re_id} (agent-board read --all lists them)")
+            re_id = parent.get("re") or parent["id"]
+        post = {"id": "", "from": me, "from_sid": sid, "slot": slot, "to": [n for n, _ in targets],
+                "to_sid": [s for _, s in targets], "paths": paths, "re": re_id or "", "text": text,
+                "ts": now, "seen": {}}
+        if broadcast(post):
+            recent = [p for p in posts if p["from"] == me and broadcast(p) and now - p["ts"] < 3600]
+            if len(recent) >= BROADCASTS_PER_HOUR:
+                die(f"{len(recent)} posts to everyone in the last hour already. Address this one "
+                    "(--to NAME or --path PATH), or let it wait.")
+        post["id"] = new_id(posts)
+        posts.append(post)
+        write_jsonl(POSTS, posts)
+        panes = set(tmux("list-panes", "-a", "-F", "#{pane_id}").split())
+        for stamp in SEEN.iterdir() if panes and SEEN.is_dir() else ():
+            if "%" + stamp.name not in panes:
+                stamp.unlink(missing_ok=True)
+    where = f"as a reply in {re_id}" if re_id else f"to {addressee(post)}"
+    tail = "" if broadcast(post) else "; it reaches them after their next tool call"
+    print(f"posted {post['id']} {where}{tail}")
+    if broadcast(post) and re.search(r"\b(hold|releasing)\b", text, re.I):
+        print("  for a release, pin or prod hold use agent-board hold NAME: it stops the others, a post only asks them")
+    kinds = {a["name"]: a["kind"] for a in fleet(0)} if idle or wake else {}
+    woken = [n for n in idle if wake and kinds.get(n) == "opencode"]
+    for s in (s for n, s in targets if n in woken):
+        (STATE / "wake").mkdir(parents=True, exist_ok=True)
+        (STATE / "wake" / s.lstrip("$")).write_text(post["id"])
+    if woken:
+        print(f"  waking {', '.join(woken)}")
+    idle = [n for n in idle if n not in woken]
+    if idle:
+        how = "agent-board post --wake wakes an OpenCode agent, SendMessage wakes the others" \
+            if any(kinds.get(n) == "opencode" for n in idle) else "SendMessage wakes an agent"
+        print(f"  {', '.join(idle)} {'is' if len(idle) == 1 else 'are'} idle and will read it when next working; "
+              f"if it cannot wait, {how}")
+
+
+def cmd_guard(argv):
+    pane = os.environ.get("TMUX_PANE", "")
+    me = tmux("display-message", "-p", "-t", pane, "#{session_name}") if pane else ""
+    if not me or not argv:
+        return
+    path, now = norm(argv[0]), time.time()
+    held = [(r, q) for r in visible(read(), int(now), fleet(0)) if r["agent"] != me
+            for q in r.get("paths", []) if clash(path, q)]
+    if not held:
+        return
+    for r, q in held:
+        print(f"{path} is held on the board by {label(r)} for {age(now - r.get('since', now))}"
+              + (f": {r['what']}" if r.get("what") else ""))
+    print(f"Settle it before you edit: agent-board post \"…\" --to {held[0][0]['agent']}. "
+          "If it is settled, repeat the edit.")
+    sys.exit(2)
+
+
+def cmd_reply(argv):
+    if not argv:
+        die('agent-board reply ID "text"')
+    cmd_post(argv, reply_to=argv.pop(0))
+
+
+def show_post(p, now, colour, me, indent=""):
+    c = (lambda code, s: f"{code}{s}{RESET}") if colour else (lambda code, s: s)
+    who = c(NAME, p["from"]) + (c(DIM, f" (a{p['slot']})") if p.get("slot") else "")
+    head = f"{indent}[{p['id']}] {who}"
+    if not p.get("re"):
+        head += c(DIM, f" → {addressee(p)}")
+    head += c(DIM, f", {age(now - p['ts'])} ago")
+    if me and me in p.get("to", []):
+        head += c(AMBER, "  for you")
+    return f"{head}\n{indent}  {p['text']}"
+
+
+def cmd_read(argv):
+    every = "--all" in argv
+    me = take(argv, "--as")
+    me_sid = ""
+    if me is None and os.environ.get("TMUX_PANE"):
+        me = tmux("display-message", "-p", "-t", os.environ["TMUX_PANE"], "#{session_name}")
+        me_sid = tmux("display-message", "-p", "-t", os.environ["TMUX_PANE"], "#{session_id}")
+    now = int(time.time())
+    claimed = my_claims(me, now) if me else []
+    colour = sys.stdout.isatty()
+    with locked():
+        posts = expire_posts(now)
+        shown, fresh = [], False
+        for thread in sorted(threads(posts).values(), key=lambda t: -max(p["ts"] for p in t)):
+            mine = any(for_me(p, me, me_sid, thread, claimed) or p["from"] == me for p in thread)
+            if every or mine or broadcast(thread[0]):
+                shown.append(thread)
+                for p in thread:
+                    if me and p["from"] != me and me not in p.setdefault("seen", {}):
+                        p["seen"][me] = now
+                        fresh = True
+        if fresh:
+            write_jsonl(POSTS, posts)
+    holds = live_holds(now)
+    if holds:
+        print("HOLDS")
+        for h in holds:
+            print("  " + hold_line(h, now, me))
+        print()
+    if not shown:
+        print("no notes for you" + ("" if every else " (agent-board read --all shows every thread)"))
+        return
+    for thread in shown:
+        print(show_post(thread[0], now, colour, me))
+        for p in thread[1:]:
+            print(show_post(p, now, colour, me, "    "))
+        print()
+
+
+def cmd_hook(argv):
+    try:
+        event = json.loads(sys.stdin.read() or "{}").get("hook_event_name", "PostToolUse")
+    except ValueError:
+        event = "PostToolUse"
+    pane = os.environ.get("TMUX_PANE", "")
+    if not pane:
+        return
+    me = tmux("display-message", "-p", "-t", pane, "#{session_name}")
+    me_sid = tmux("display-message", "-p", "-t", pane, "#{session_id}")
+    if not me:
+        return
+    now = int(time.time())
+    notes, reminder = [], ""
+    with locked():
+        if POSTS.exists():
+            claimed = [q for r in read() if r["agent"] == me for q in r.get("paths", [])]
+            posts = expire_posts(now)
+            for root, thread in threads(posts).items():
+                for p in thread:
+                    if seen_by(p, me) or not for_me(p, me, me_sid, thread, claimed):
+                        continue
+                    p.setdefault("seen", {})[me] = now
+                    lead = f"reply in {root}" if p.get("re") else \
+                        f"to {'you' if me in p.get('to', []) or me_sid in p.get('to_sid', []) else addressee(p)}"
+                    notes.append(f"[{p['id']}] {p['from']}" + (f" (a{p['slot']})" if p.get("slot") else "")
+                                 + f", {lead}, {age(now - p['ts'])} ago: {p['text']}")
+            if notes:
+                write_jsonl(POSTS, posts)
+            mtime = POSTS.stat().st_mtime_ns
+            SEEN.mkdir(parents=True, exist_ok=True)
+            stamp = SEEN / pane.lstrip("%")
+            stamp.touch()
+            os.utime(stamp, ns=(mtime, mtime))
+        if event == "UserPromptSubmit":
+            recs = read()
+            mine = next((r for r in recs if r["agent"] == me), None)
+            if mine and mine.get("what") and now - mine.get("what_ts", mine.get("since", now)) > STALE_STATUS \
+                    and now - mine.get("reminded", 0) > STALE_STATUS:
+                mine["reminded"] = now
+                write_jsonl(BOARD, recs)
+                reminder = (f"Your status on the board still reads “{mine['what']}”, set "
+                            f"{age(now - mine.get('what_ts', mine['since']))} ago. If this prompt moves you on to "
+                            "something else, update it with agent-board claim --what \"…\", or clear it with "
+                            "agent-board done. If it still holds, ignore this.")
+            holds = read_holds()
+            old = [h for h in holds if h["agent"] == me and not h.get("pid")
+                   and now - max(h.get("since", now), h.get("reminded", 0)) > HOLD_REMIND]
+            if old:
+                for h in old:
+                    h["reminded"] = now
+                write_jsonl(HOLDS, holds)
+                reminder += ("\n\n" if reminder else "") + (
+                    f"You still hold {', '.join(h['name'] for h in old)} on the board, taken "
+                    f"{age(now - min(h['since'] for h in old))} ago, and it stops the other agents. "
+                    f"When that step is over: agent-board free {' '.join(h['name'] for h in old)}.")
+    parts = []
+    if notes:
+        parts.append("Board notes for you from other agents (agent-board). Answer with "
+                     "`agent-board reply <id> \"…\"` only if one needs an answer; otherwise carry on.\n"
+                     + "\n".join(notes))
+    if reminder:
+        parts.append(reminder)
+    if parts:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": "\n\n".join(parts)}}))
+
+
+def cw(ch):
+    if ord(ch) < 0x300:
+        return 1
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def width(s):
+    return sum(cw(c) for c in s)
+
+
+def clip(s, w):
+    if w <= 0:
+        return ""
+    if width(s) <= w:
+        return s
+    out, n = [], 0
+    for ch in s:
+        if n + cw(ch) > w - 1:
+            break
+        out.append(ch)
+        n += cw(ch)
+    return "".join(out) + "…"
+
+
+def clip_left(s, w):
+    if w <= 0:
+        return ""
+    if width(s) <= w:
+        return s
+    out, n = [], 0
+    for ch in reversed(s):
+        if n + cw(ch) > w - 1:
+            break
+        out.append(ch)
+        n += cw(ch)
+    return "…" + "".join(reversed(out))
+
+
+def wrap(text, w, lines):
+    words, cur, out = text.split(), "", []
+    for word in words:
+        while width(word) > w:
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(word[:w])
+            word = word[w:]
+        if cur and width(cur) + 1 + width(word) > w:
+            out.append(cur)
+            cur = word
+        else:
+            cur = f"{cur} {word}" if cur else word
+    if cur:
+        out.append(cur)
+    if len(out) > lines:
+        out = out[:lines]
+        out[-1] = clip(out[-1] + " …", w)
+    return out or [""]
+
+
+class Line:
+    __slots__ = ("w", "n", "parts")
+
+    def __init__(self, w):
+        self.w, self.n, self.parts = max(0, w), 0, []
+
+    def add(self, text, style=""):
+        room = self.w - self.n
+        if room <= 0 or not text:
+            return self
+        out, used = [], 0
+        for ch in text:
+            c = cw(ch)
+            if used + c > room:
+                break
+            out.append(ch)
+            used += c
+        if out:
+            body = "".join(out)
+            self.parts.append(f"{style}{body}{RESET}" if style else body)
+            self.n += used
+        return self
+
+    def segs(self, segs):
+        for text, style in segs:
+            self.add(text, style)
+        return self
+
+    def pad(self, col):
+        return self.add(" " * (col - self.n)) if col > self.n else self
+
+    def fill(self, ch, col, style=""):
+        return self.add(ch * (col - self.n), style) if col > self.n else self
+
+    def right(self, segs, margin=1):
+        need = segw(segs)
+        if self.n + 2 + need + margin > self.w:
+            return self
+        self.pad(self.w - margin - need)
+        return self.segs(segs)
+
+    def out(self):
+        return "".join(self.parts) + " " * (self.w - self.n)
+
+
+def segw(segs):
+    return sum(width(t) for t, _ in segs)
+
+
+def toplevel(path):
+    p = Path(path)
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    while p != p.parent:
+        if (p / ".git").exists():
+            return str(p)
+        p = p.parent
+    return None
+
+
+def claim_abs(p, slot):
+    if p.startswith("~/"):
+        return HOME / p[2:]
+    if p.startswith("/"):
+        return Path(p)
+    first = p.split("/")[0]
+    if slot and (WS / f"Agent{slot}" / first).exists():
+        return WS / f"Agent{slot}" / p
+    if (WS / first).exists():
+        return WS / p
+    if (FORGE / first).exists():
+        return FORGE / p
+    return (WS if WS.exists() else FORGE) / p
+
+
+_transcripts = {}
+_said = {}
+TURN = re.compile(r'"type":\s?"(?:user|assistant)"')
+
+
+def transcript(sid):
+    p = _transcripts.get(sid)
+    if p is not None and p.exists():
+        return p
+    try:
+        dirs = list((CFG / "projects").iterdir())
+    except OSError:
+        return None
+    for d in dirs:
+        q = d / f"{sid}.jsonl"
+        if q.exists():
+            _transcripts[sid] = q
+            return q
+    return None
+
+
+def message_text(o):
+    c = o.get("message", {}).get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def said(path):
+    try:
+        st = path.stat()
+    except OSError:
+        return {}
+    key = (st.st_size, st.st_mtime_ns)
+    hit = _said.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    with open(path, "rb") as fh:
+        start = max(0, st.st_size - 400000)
+        fh.seek(start)
+        lines = fh.read().decode("utf-8", "replace").splitlines()[1 if start else 0:]
+    res = {"assistant": "", "user": "", "last": "", "ts": 0, "sent": sends(path, st.st_size)}
+    for line in lines:
+        if not TURN.search(line):
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        if o.get("isMeta") or o.get("isSidechain"):
+            continue
+        t = " ".join(message_text(o).split())
+        if not t or t.startswith("<") or t.startswith("[Request interrupted"):
+            continue
+        kind = o.get("type")
+        if kind == "user" and t.startswith(BRIEF):
+            continue
+        res[kind] = t
+        res["last"] = kind
+        res["ts"] = iso_ts(o.get("timestamp", "")) or res["ts"]
+    _said[path] = (key, res)
+    return res
+
+
+_sends = {}
+SEND = re.compile(r'"name":"SendMessage"|"tool_use_id"')
+SUBAGENT = re.compile(r"^a[0-9a-f]{12,}$")
+
+
+def sends(path, size):
+    st = _sends.get(path)
+    if st is None or size < st["offset"]:
+        st = {"offset": max(0, size - 8_000_000), "sent": [], "pending": {}, "partial": True}
+        _sends[path] = st
+    if size > st["offset"]:
+        with open(path, "rb") as fh:
+            fh.seek(st["offset"])
+            chunk = fh.read(size - st["offset"])
+        end = chunk.rfind(b"\n") + 1
+        lines = chunk[:end].decode("utf-8", "replace").splitlines()
+        if st.pop("partial", False) and lines:
+            lines = lines[1:]
+        st["offset"] += end
+        for line in lines:
+            if not SEND.search(line):
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            content = o.get("message", {}).get("content")
+            if not isinstance(content, list):
+                continue
+            for b in content:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use" and b.get("name") == "SendMessage":
+                    i = b.get("input") or {}
+                    to = str(i.get("to", "")).split(" [")[0]
+                    if i.get("message") and not SUBAGENT.match(to) and to != "main":
+                        m = {"to": to, "summary": str(i.get("summary", "")),
+                             "text": " ".join(str(i.get("message", "")).split()),
+                             "ts": iso_ts(o.get("timestamp", ""))}
+                        st["pending"][b.get("id")] = m
+                        st["sent"].append(m)
+                elif b.get("type") == "tool_result" and b.get("tool_use_id") in st["pending"]:
+                    body = json.dumps(b.get("content", ""))
+                    m = st["pending"].pop(b["tool_use_id"])
+                    if b.get("is_error") or '"success":false' in body or '\\"success\\":false' in body:
+                        st["sent"] = [x for x in st["sent"] if x is not m]
+        cut = time.time() - POST_TTL
+        st["sent"] = [m for m in st["sent"] if m["ts"] >= cut]
+    return st["sent"]
+
+
+def question(text):
+    t = text.rstrip()
+    if not t.endswith("?"):
+        return ""
+    cut = max(t.rfind(". ", 0, len(t) - 1), t.rfind("! ", 0, len(t) - 1), t.rfind(": ", 0, len(t) - 1))
+    return t[cut + 2:] if cut >= 0 else t
+
+
+def collect_agents(idle_wait):
+    agents = fleet(idle_wait)
+    for a in agents:
+        if a["kind"] == "claude" and a["session_id"]:
+            t = transcript(a["session_id"])
+            if t is not None:
+                a["said"] = said(t)
+    return agents
+
+
+def git(d, *args):
+    r = subprocess.run(["git", "-C", d, *args], capture_output=True, text=True, errors="replace")
+    return r.stdout if r.returncode == 0 else None
+
+
+def key_root(top, common):
+    canon = os.path.basename(os.path.dirname(os.path.normpath(os.path.join(top, common))))
+    if top == str(WS) or top.startswith(str(WS) + "/"):
+        return canon
+    if top.startswith(str(FORGE) + "/"):
+        return os.path.relpath(top, FORGE)
+    if top.startswith(str(HOME) + "/"):
+        return "~/" + os.path.relpath(top, HOME)
+    return top
+
+
+def upstream_gone(top, branch):
+    merge = (git(top, "config", f"branch.{branch}.merge") or "").strip()
+    remote = (git(top, "config", f"branch.{branch}.remote") or "").strip()
+    if not merge.startswith("refs/heads/") or remote in ("", "."):
+        return False
+    return git(top, "rev-parse", "-q", "--verify", f"refs/remotes/{remote}/{merge[11:]}") is None
+
+
+def repo_info(d):
+    head = git(d, "rev-parse", "--show-toplevel", "--git-common-dir", "--abbrev-ref", "HEAD")
+    if head is None:
+        return None
+    parts = head.splitlines()
+    if len(parts) < 3:
+        return None
+    top, common, branch = parts[0], parts[1], parts[2]
+    in_ws = top.startswith(str(WS) + "/")
+    root = key_root(top, common)
+    landed = branch != "HEAD" and upstream_gone(top, branch)
+    if landed:
+        spans = [("HEAD", None)]
+    else:
+        if in_ws:
+            base = (git(top, "merge-base", "HEAD", "origin/main") or git(top, "rev-parse", "origin/main") or "").strip()
+        else:
+            up = (git(top, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}") or "").strip()
+            base = (git(top, "merge-base", "HEAD", up) or "").strip() if up else ""
+        base = base or "HEAD"
+        merged = ""
+        if in_ws and base != "HEAD":
+            mt = subprocess.run(["git", "-C", top, "merge-tree", "--write-tree", "origin/main", "HEAD"],
+                                capture_output=True, text=True, errors="replace")
+            if mt.returncode in (0, 1):
+                merged = mt.stdout.split("\n")[0].strip()
+        spans = [("origin/main", merged), ("HEAD", None)] if merged else [(base, None)]
+    counts = {}
+    for left, right in spans:
+        toks = (git(top, "diff", "--numstat", "-z", left, *([right] if right else [])) or "").split("\0")
+        i = 0
+        while i < len(toks):
+            t = toks[i]
+            i += 1
+            if not t:
+                continue
+            f = t.split("\t")
+            if len(f) < 3:
+                continue
+            path = f[2]
+            if not path and i + 1 < len(toks):
+                path = toks[i + 1]
+                i += 2
+            plus, minus = counts.get(path, (0, 0))
+            counts[path] = (plus + (int(f[0]) if f[0].isdigit() else 0), minus + (int(f[1]) if f[1].isdigit() else 0))
+    files = [[str(p_), str(m_), f"{root}/{path}"] for path, (p_, m_) in counts.items()]
+    others = (git(top, "ls-files", "--others", "--exclude-standard", "-z") or "").split("\0")
+    for path in [p for p in others if p][:400]:
+        try:
+            with open(os.path.join(top, path), "rb") as fh:
+                chunk = fh.read(2_000_000)
+            plus = "-" if b"\0" in chunk[:8000] else str(chunk.count(b"\n"))
+        except OSError:
+            plus = "-"
+        files.append([plus, "0", f"{root}/{path}"])
+    m = re.match(re.escape(str(WS)) + r"/Agent(\d+)/", top + "/")
+    return {"top": top, "root": root, "branch": "detached" if branch == "HEAD" else branch,
+            "landed": landed, "files": files, "slot": m.group(1) if m else ""}
+
+
+def repo_dirs(agents, recs):
+    dirs = set()
+    for a in agents:
+        if a["parked"]:
+            continue
+        if a["slot"]:
+            try:
+                kids = list((WS / f"Agent{a['slot']}").iterdir())
+            except OSError:
+                kids = []
+            dirs.update(str(k) for k in kids if (k / ".git").exists())
+        elif a["cwd"]:
+            top = toplevel(a["cwd"])
+            if top and top != str(WS):
+                dirs.add(top)
+    for r in recs:
+        for p in r.get("paths", []):
+            top = toplevel(claim_abs(p, r.get("slot")))
+            if top and top != str(WS):
+                dirs.add(top)
+    return dirs
+
+
+class GitRefresh(threading.Thread):
+    def __init__(self, dirs):
+        super().__init__(daemon=True)
+        self.dirs = sorted(dirs)
+
+    def run(self):
+        try:
+            STATE.mkdir(parents=True, exist_ok=True)
+            with open(GITLOCK, "w") as lk:
+                try:
+                    fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    return
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(8) as ex:
+                    infos = [i for i in ex.map(repo_info, self.dirs) if i]
+                tmp = GITCACHE.with_suffix(".tmp")
+                tmp.write_text(json.dumps({"ts": time.time(), "repos": {i["top"]: i for i in infos}}))
+                os.replace(tmp, GITCACHE)
+        except Exception:
+            pass
+
+
+def stats(files):
+    plus = sum(int(f[0]) for f in files if f[0].isdigit())
+    minus = sum(int(f[1]) for f in files if f[1].isdigit())
+    return len(files), plus, minus
+
+
+def stat_segs(files):
+    n, plus, minus = stats(files)
+    if not n:
+        return [("no changes yet", FAINT)]
+    return [(f"{n} file{'s' if n != 1 else ''}", TEXT), ("  ", ""), (f"+{plus}", GREEN), (" ", ""), (f"−{minus}", RED)]
+
+
+def current_names(p, live):
+    q = dict(p)
+    q["unread"] = [n for n in p.get("to", []) if n not in p.get("seen", {})]
+    if p.get("from_sid") in live:
+        q["from"] = live[p["from_sid"]]
+    sids = p.get("to_sid") or []
+    if len(sids) == len(p.get("to", [])):
+        names = dict(zip(p["to"], sids))
+        q["to"] = [live.get(names[n], n) for n in p["to"]]
+        q["unread"] = [live.get(names[n], n) for n in q["unread"]]
+    return q
+
+
+def analyse(agents, recs, gitdata, cleared):
+    now = time.time()
+    by_name = {a["name"]: a for a in agents}
+    live_slots = {a["slot"]: a for a in agents if a["slot"] and not a["parked"]}
+    recent = {s for s, a in live_slots.items() if now - a["active"] <= RECENT}
+    repos = [r for r in gitdata.get("repos", {}).values() if not r["slot"] or r["slot"] in live_slots]
+    slot_files = defaultdict(list)
+    loose_files = defaultdict(list)
+    for r in repos:
+        for f in r["files"]:
+            (slot_files[r["slot"]] if r["slot"] else loose_files[r["top"]]).append(f + [r["branch"]])
+
+    def own(a):
+        if a.get("slot"):
+            return slot_files.get(a["slot"], [])
+        top = toplevel(a["cwd"]) if a.get("cwd") else None
+        return loose_files.get(top, []) if top else []
+
+    collisions, seen_pairs, claims = [], set(), []
+    for r in recs:
+        a = by_name.get(r["agent"], {})
+        slot = r.get("slot") or a.get("slot", "")
+        paths = []
+        for p in r.get("paths", []):
+            mine = [f for f in slot_files.get(slot, []) if under(f[2], p)] if slot else \
+                [f for fs in loose_files.values() for f in fs if under(f[2], p)]
+            overl = [(o, q) for o in recs if o is not r for q in o.get("paths", []) if clash(p, q)]
+            intr = []
+            for s, fs in slot_files.items():
+                if s == slot or s not in recent or whole_repo(p):
+                    continue
+                inside = [f for f in fs if under(f[2], p)]
+                if inside:
+                    intr.append((live_slots[s], inside))
+                    collisions.append(("intrude", live_slots[s], r, p, inside))
+            for o, q in overl:
+                pair = tuple(sorted([(r["agent"], p), (o["agent"], q)]))
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    collisions.append(("claim", r, p, o, q))
+            paths.append({"path": p, "files": mine, "overlaps": overl, "intruders": intr,
+                          "branches": sorted({f[3] for f in mine})})
+        stale = now - r.get("what_ts", r.get("since", now)) > STALE_STATUS and a.get("state") != "working"
+        claims.append({"rec": r, "agent": a, "paths": paths, "stale": stale,
+                       "hot": any(x["overlaps"] or x["intruders"] for x in paths)})
+
+    by_key = defaultdict(set)
+    for s, fs in slot_files.items():
+        if s in recent:
+            for f in fs:
+                by_key[f[2]].add(s)
+    groups = defaultdict(list)
+    for k, ss in by_key.items():
+        if len(ss) > 1:
+            groups[tuple(sorted(ss, key=int))].append(k)
+
+    def busy_first(kv):
+        who = [live_slots[s] for s in kv[0]]
+        return (not any(x["state"] == "working" for x in who), any(x["frozen"] for x in who), -len(kv[1]))
+    for ss, keys in sorted(groups.items(), key=busy_first):
+        collisions.append(("files", [live_slots[s] for s in ss], sorted(keys)))
+
+    claimed = {r["agent"] for r in recs}
+    needs = []
+    for a in agents:
+        if a["parked"] or a["frozen"]:
+            continue
+        s = a["said"]
+        q = question(s.get("assistant", "")) if s.get("last") == "assistant" else ""
+        why = []
+        if a["state"] == "asking":
+            why.append(("a dialog is open on its screen", PURPLE))
+        elif q and a["state"] in ("idle", "waiting"):
+            why.append((f"asked: {q}", PURPLE))
+        elif a["state"] == "waiting":
+            why.append((f"idle for {ago(a['seen'])}", AMBER))
+        if why:
+            needs.append((a, why))
+    needs.sort(key=lambda n: -n[0]["seen"])
+
+    loose = []
+    for a in agents:
+        if a["name"] in claimed or a["parked"]:
+            continue
+        fs = own(a)
+        if fs or a["state"] == "working":
+            roots = defaultdict(list)
+            for f in fs:
+                roots[f[2].split("/")[0]].append(f)
+            loose.append((a, fs, roots))
+    loose.sort(key=lambda x: (x[0]["state"] != "working", -len(x[1])))
+
+    live = sessions() or {}
+    by_cname = {a["cname"]: a["name"] for a in agents if a["cname"]}
+    feed = []
+    for thread in threads(live_posts(read_posts(), int(now))).values():
+        thread.sort(key=lambda p: p["ts"])
+        feed.append({"kind": "post", "ts": thread[-1]["ts"], "thread": [current_names(p, live) for p in thread]})
+    for a in agents:
+        for m in a["said"].get("sent", []):
+            if now - m["ts"] <= POST_TTL:
+                feed.append({"kind": "direct", "ts": m["ts"], "from": a, "to": by_cname.get(m["to"], m["to"]),
+                             **{k: m[k] for k in ("summary", "text")}})
+    feed.sort(key=lambda f: -f["ts"])
+
+    counts = defaultdict(int)
+    for a in agents:
+        counts["parked" if a["parked"] else "frozen" if a["frozen"] else a["state"]] += 1
+    return {"claims": claims, "collisions": collisions, "needs": needs, "loose": loose, "cleared": cleared,
+            "counts": counts, "by_name": by_name, "feed": feed, "holds": live_holds(int(now), agents)}
+
+
+def log_tail(n=6):
+    try:
+        with open(LOG, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 65536))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if time.time() - r.get("ended", 0) > 86400:
+            break
+        if r.get("name"):
+            continue
+        out.append(r)
+        if len(out) >= n:
+            break
+    return out
+
+
+def forgotten(need, now):
+    a, why = need
+    return why[0][0].startswith("idle for") and now - a["seen"] > RECENT
+
+
+def state_colour(a):
+    if not a:
+        return FAINT
+    if a.get("parked"):
+        return DIM
+    if a.get("frozen"):
+        return BLUE
+    return STATE_COLOUR.get(a.get("state"), DIM)
+
+
+def state_word(a):
+    if not a:
+        return "gone"
+    if a["parked"]:
+        return "parked"
+    if a["frozen"]:
+        return "frozen"
+    return a["state"]
+
+
+def slot_tag(slot):
+    return [(f" a{slot}", DIM)] if slot else []
+
+
+def plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def day_label(ts, now):
+    d, today = datetime.fromtimestamp(ts).date(), datetime.fromtimestamp(now).date()
+    n = (today - d).days
+    return "Today" if n == 0 else "Yesterday" if n == 1 else datetime.fromtimestamp(ts).strftime("%A %-d %b")
+
+
+_history = {}
+
+
+def history_threads(now):
+    key = []
+    for f in (POSTS_LOG, POSTS):
+        try:
+            st = f.stat()
+            key.append((st.st_size, st.st_mtime_ns))
+        except OSError:
+            key.append(None)
+    key.append(int(now // 600))
+    if _history.get("key") == key:
+        return _history["val"]
+    posts = {(p["id"], p["ts"]): p for p in read_jsonl(POSTS_LOG, "id") + read_posts()}
+    out = []
+    for t in threads(list(posts.values())).values():
+        t.sort(key=lambda p: p["ts"])
+        if now - t[-1]["ts"] <= HISTORY_DAYS * 86400:
+            out.append(t)
+    out.sort(key=lambda t: -t[0]["ts"])
+    _history.update(key=key, val=out)
+    return out
+
+
+HOWTO = (("agent-board", "their briefing: status, notes, clashes"),
+         ('agent-board claim PATH --what "…"', "say what they are on"),
+         ("agent-board done", "clear it when finished"),
+         ('agent-board hold NAME --what "…"', "before a release, pin move or prod sync"),
+         ("agent-board free NAME", "give the hold back"),
+         ('agent-board post "…" --to NAME', "a note, arrives after a tool call"),
+         ('agent-board reply ID "…"', "answer in a thread"),
+         ("agent-board read", "notes for them, and to everyone"))
+
+
+class Page:
+    def __init__(self, me):
+        self.me = me
+        self.sel = None
+        self.scroll = [0, 0]
+        self.focus = 0
+        self.history = False
+        self.items = []
+        self.cols = []
+        self.data = None
+        self.git_ts = 0
+        self.error = ""
+        self.body_h = 10
+        self.top_h = 4
+        self.colx = None
+        self.follow = False
+
+    def heading(self, w, title, colour, count=None, note="", up=0):
+        l = Line(w).add("  ").add(title, colour + BOLD)
+        if count is not None:
+            l.add(f"  {count}", DIM)
+        if note:
+            l.add(f"   {note}", FAINT)
+        tail = [(f"  ↑ {up} more ", FAINT)] if up else []
+        l.add("  ").fill("─", w - 2 - segw(tail), BORDER).segs(tail)
+        return [l.out(), " " * w]
+
+    def marker(self, key):
+        return ("▍ ", CYAN) if self.sel == key else ("  ", "")
+
+    def thread_block(self, th, w, when):
+        root = th[0]
+        key = f"post:{root['id']}"
+        sel = self.sel == key
+        blk = []
+        l = Line(w).segs([self.marker(key)]).add("◇ ", TEAL).add(root["from"], NAME + BOLD)
+        l.segs(slot_tag(root.get("slot"))).add("  →  ", FAINT)
+        l.add(addressee(root), AMBER if broadcast(root) else TEXT)
+        l.right([(when(root["ts"]), DIM), ("  ", ""), (root["id"], FAINT)])
+        blk.append(l.out())
+        for x in wrap(root["text"], w - 8, 14 if sel else 5):
+            blk.append(Line(w).add("    ").add(x, WHITE).out())
+        replies = th[1:]
+        shown = replies if sel else replies[-2:]
+        if len(replies) > len(shown):
+            blk.append(Line(w).add(f"      ↳ {plural(len(replies) - len(shown), 'earlier reply')}, select to read", FAINT).out())
+        for p in shown:
+            blk.append(Line(w).add("      ↳ ", BORDER).add(p["from"], NAME + BOLD).add(f"  {when(p['ts'])}", FAINT).out())
+            for x in wrap(p["text"], w - 10, 10 if sel else 3):
+                blk.append(Line(w).add("        ").add(x, TEXT).out())
+        unread = root["unread"] if "unread" in root else [n for n in root.get("to", []) if n not in root.get("seen", {})]
+        read_by = sorted(root.get("seen", {}))
+        if unread:
+            blk.append(Line(w).add("    ○ not read yet by ", AMBER).add(", ".join(unread), AMBER).out())
+        elif read_by:
+            blk.append(Line(w).add("    ✓ ", GREEN).add("read by " + clip(", ".join(read_by), w - 14), FAINT).out())
+        blk.append(" " * w)
+        return key, blk, root["from"]
+
+    def direct_block(self, f, w, when):
+        a = f["from"]
+        key = f"direct:{a['name']}:{f['ts']}"
+        sel = self.sel == key
+        l = Line(w).segs([self.marker(key)]).add("⇢ ", CYAN).add(a["name"], NAME + BOLD)
+        l.add("  →  ", FAINT).add(f["to"], TEXT)
+        l.right([("direct", FAINT), ("  ", ""), (when(f["ts"]), DIM)])
+        blk = [l.out()]
+        for x in wrap(f["text"] or f["summary"], w - 8, 12 if sel else 2):
+            blk.append(Line(w).add("    ").add(x, TEXT).out())
+        blk.append(" " * w)
+        return key, blk, a["name"]
+
+    def messages(self, w):
+        feed = self.data["feed"]
+        rel = lambda ts: f"{ago(ts)} ago"
+        head = lambda up: self.heading(w, "MESSAGES", TEAL, len(feed), "board notes and direct messages, last 24 h", up)
+        items = []
+        if not feed:
+            items.append((None, [Line(w).add("    Quiet. Agents post here when their work meets someone else's.", DIM).out(),
+                                 " " * w], None))
+        for f in feed:
+            items.append(self.thread_block(f["thread"], w, rel) if f["kind"] == "post" else self.direct_block(f, w, rel))
+        return head, items
+
+    def history_view(self, w):
+        now = time.time()
+        ths = history_threads(now)
+        head = lambda up: self.heading(w, "HISTORY", TEAL, len(ths), f"board notes, last {HISTORY_DAYS} days", up)
+        items, day = [], None
+        if not ths:
+            items.append((None, [Line(w).add(f"    No board notes in the last {HISTORY_DAYS} days.", DIM).out()], None))
+        for th in ths:
+            d = day_label(th[0]["ts"], now)
+            if d != day:
+                day = d
+                items.append((None, [Line(w).add("  ").add(d, TEXT + BOLD).out(), " " * w], None))
+            start = datetime.fromtimestamp(th[0]["ts"]).date()
+            when = lambda ts, start=start: time.strftime(
+                "%H:%M" if datetime.fromtimestamp(ts).date() == start else "%a %H:%M", time.localtime(ts))
+            items.append(self.thread_block(th, w, when))
+        return head, items
+
+    def working(self, w):
+        d = self.data
+        head = lambda up: self.heading(w, "WORKING ON", CYAN, len(d["claims"]), "what each agent says it is doing", up)
+        items = []
+        if not d["claims"]:
+            items.append((None, [Line(w).add("    Nobody has said what they are working on.", DIM).out(), " " * w], None))
+        claims = sorted(d["claims"], key=lambda c: (not c["hot"], c["rec"]["agent"] != self.me, -c["rec"].get("ts", 0)))
+        for c in claims:
+            r, a = c["rec"], c["agent"]
+            key = f"claim:{r['agent']}"
+            sel = self.sel == key
+            me = r["agent"] == self.me
+            bar = ("▌ " if sel else "▎ ", CYAN if sel else state_colour(a))
+            blk = []
+            l = Line(w).add(" ").segs([bar]).add(r["agent"], (WHITE if me else NAME) + BOLD).segs(slot_tag(r.get("slot")))
+            l.add("  ").add(state_word(a), state_colour(a))
+            if me:
+                l.add("  you", CYAN)
+            l.right([(f"for {age(time.time() - r.get('since', time.time()))}", DIM)])
+            blk.append(l.out())
+            for x in wrap(r.get("what") or "no sentence yet", w - 6, 4 if sel else 2):
+                blk.append(Line(w).add(" ").segs([bar]).add(x, (FAINT if c["stale"] else WHITE) if r.get("what") else FAINT).out())
+            if c["stale"]:
+                blk.append(Line(w).add(" ").segs([bar]).add(f"said {ago(r.get('what_ts', r.get('since')))} ago, may be out of date", FAINT).out())
+            for p in c["paths"]:
+                hot = bool(p["overlaps"] or p["intruders"])
+                rt = ([(f"{BRANCH} {p['branches'][0]}", TEAL), ("   ", "")] if p["branches"] else []) + stat_segs(p["files"])
+                l = Line(w).add(" ").segs([bar]).add("  ")
+                l.add(clip_left(p["path"], w - l.n - segw(rt) - 4), RED if hot else TEXT)
+                l.right(rt)
+                blk.append(l.out())
+                for o, q in p["overlaps"]:
+                    blk.append(Line(w).add(" ").segs([bar]).add("    ✖ also claimed by ", RED).add(o["agent"], NAME).segs(slot_tag(o.get("slot"))).out())
+                for x, inside in p["intruders"]:
+                    blk.append(Line(w).add(" ").segs([bar]).add("    ◆ ", AMBER).add(x["name"], NAME).segs(slot_tag(x["slot"]))
+                               .add(f" changes {plural(len(inside), 'file')} in here", AMBER).out())
+                if sel:
+                    for f in p["files"][:8]:
+                        rel = f[2][len(p["path"]):].lstrip("/") or os.path.basename(f[2])
+                        st = [(f"+{f[0]}", GREEN), (" ", ""), (f"−{f[1]}", RED)]
+                        l = Line(w).add(" ").segs([bar]).add("    ")
+                        l.add(clip_left(rel, w - l.n - segw(st) - 3), DIM).right(st)
+                        blk.append(l.out())
+                    if len(p["files"]) > 8:
+                        blk.append(Line(w).add(" ").segs([bar]).add(f"    … {len(p['files']) - 8} more", FAINT).out())
+            s = a.get("said", {}) if a else {}
+            if sel and s.get("assistant"):
+                for x in wrap("› " + s["assistant"], w - 6, 3):
+                    blk.append(Line(w).add(" ").segs([bar]).add(x, DIM).out())
+            blk.append(" " * w)
+            items.append((key, blk, r["agent"]))
+        if d["loose"]:
+            items.append((None, [Line(w).add("  without a status", TEXT).right([("working, or holding changes", FAINT), ("  ", "")]).out()], None))
+            for a, fs, roots in d["loose"]:
+                key = f"loose:{a['name']}"
+                sel = self.sel == key
+                l = Line(w).segs([self.marker(key)]).add("· ", state_colour(a)).add(a["name"], NAME).segs(slot_tag(a["slot"]))
+                l.add("  ").add(state_word(a), state_colour(a))
+                where = ", ".join(sorted(roots, key=lambda k: -len(roots[k]))[:3])
+                if fs:
+                    l.add("   ").add(clip(where, max(0, w - l.n - 16)), FAINT)
+                    l.right([(plural(len(fs), "file"), DIM)])
+                blk = [l.out()]
+                if sel:
+                    for f in fs[:6]:
+                        blk.append(Line(w).add("      ").add(clip_left(f[2], w - 8), DIM).out())
+                    if a["said"].get("assistant"):
+                        for x in wrap("› " + a["said"]["assistant"], w - 6, 3):
+                            blk.append(Line(w).add("    ").add(x, DIM).out())
+                items.append((key, blk, a["name"]))
+            items.append((None, [" " * w], None))
+        return head, items
+
+    def collisions(self, w):
+        d = self.data
+        if not d["collisions"]:
+            return None, []
+        head = lambda up: self.heading(w, "COLLISIONS", RED, len(d["collisions"]), "two agents on the same files", up)
+        items = []
+        for i, c in enumerate(d["collisions"][:6]):
+            l = Line(w).add("  ✖ ", RED)
+            if c[0] == "claim":
+                _, r, p, o, q = c
+                l.add(r["agent"], NAME).add(" and ", FAINT).add(o["agent"], NAME).add(" both claim ", TEXT).add(p if p == q else f"{p} / {q}", RED)
+                blk, target = [l.out()], r["agent"]
+            elif c[0] == "intrude":
+                _, x, r, p, inside = c
+                l.add(x["name"], NAME).segs(slot_tag(x["slot"])).add(f" changes {plural(len(inside), 'file')} in ", TEXT)
+                l.add(r["agent"], NAME).add("'s ", TEXT).add(p, AMBER)
+                blk, target = [l.out()], x["name"]
+            else:
+                _, who, keys = c
+                l.add(" and ".join(x["name"] for x in who), NAME).add(f" both change {plural(len(keys), 'file')}", TEXT)
+                files = ", ".join(clip_left(k, 44) for k in keys[:2]) + (f", +{len(keys) - 2}" if len(keys) > 2 else "")
+                blk, target = [l.out(), Line(w).add("      ").add(files, FAINT).out()], who[0]["name"]
+            items.append((f"col:{i}", blk, target))
+        items.append((None, [" " * w], None))
+        return head, items
+
+    def holds(self, w):
+        hs = self.data["holds"]
+        if not hs:
+            return None, []
+        head = lambda up: self.heading(w, "HOLDS", AMBER, len(hs), "nobody else releases or syncs these", up)
+        items, now = [], time.time()
+        for h in hs:
+            key = f"hold:{h['name']}"
+            l = Line(w).segs([self.marker(key)]).add("■ ", AMBER).add(h["name"], WHITE + BOLD).add("  ")
+            l.add(h["agent"], NAME).segs(slot_tag(h.get("slot")))
+            l.right([(f"for {age(now - h.get('since', now))}", DIM)])
+            blk = [l.out()]
+            for x in wrap(h.get("what") or "", w - 8, 4 if self.sel == key else 1) if h.get("what") else []:
+                blk.append(Line(w).add("      ").add(x, TEXT).out())
+            waiters = [x["name"] for x in h.get("waiters", [])]
+            if waiters:
+                blk.append(Line(w).add("      waiting for it: ", FAINT).add(clip(", ".join(waiters), w - 28), NAME).out())
+            items.append((key, blk, h["agent"]))
+        items.append((None, [" " * w], None))
+        return head, items
+
+    def needs(self, w):
+        d = self.data
+        now = time.time()
+        if not d["needs"]:
+            return None, []
+        fresh = [n for n in d["needs"] if not forgotten(n, now)]
+        old = [n[0]["name"] for n in d["needs"] if forgotten(n, now)]
+        head = lambda up: self.heading(w, "NEEDS YOU", PURPLE, len(fresh), "", up)
+        items = []
+        for a, reasons in fresh:
+            key = f"need:{a['name']}"
+            sel = self.sel == key
+            why, colour = reasons[0]
+            l = Line(w).segs([self.marker(key)]).add("● ", state_colour(a)).add(a["name"], NAME + BOLD).segs(slot_tag(a["slot"])).add("   ")
+            blk = []
+            if sel:
+                blk.append(l.out())
+                for why_, colour_ in reasons:
+                    for x in wrap(why_, w - 8, 6):
+                        blk.append(Line(w).add("      ").add(x, colour_).out())
+            else:
+                blk.append(l.add(clip(why, w - l.n - 1), colour).out())
+            items.append((key, blk, a["name"]))
+        if old:
+            items.append((None, [Line(w).add("    idle for over a day: ", FAINT)
+                                 .add(clip(", ".join(old), w - 30), DIM).out()], None))
+        items.append((None, [" " * w], None))
+        return head, items
+
+    def cleared(self, w):
+        d = self.data
+        if not d["cleared"]:
+            return None, []
+        head = lambda up: self.heading(w, "ENDED", TEXT, len(d["cleared"]), "statuses cleared or lapsed, last 24 h", up)
+        rows = []
+        for r in d["cleared"]:
+            why = r.get("why", "")
+            mark, colour = ("✓ ", GREEN) if why == "done" else ("○ ", FAINT)
+            l = Line(w).add("  ").add(mark, colour).add(r.get("agent", "?"), NAME).add("   ")
+            word = {"done": "done", "expired": "lapsed", "gone": "session ended"}.get(why, why)
+            tail = [(f"{word} {ago(r.get('ended', 0))} ago", FAINT)]
+            l.add(clip(r.get("what") or ", ".join(r.get("paths", [])), w - l.n - segw(tail) - 3), DIM).right(tail)
+            rows.append(l.out())
+        rows.append(" " * w)
+        return head, [(None, rows, None)]
+
+    def howto(self, w):
+        head = lambda up: self.heading(w, "HOW AGENTS USE IT", TEXT, None, "", up)
+        cmdw = max(width(c) for c, _ in HOWTO) + 6
+        rows = []
+        for c, t in HOWTO:
+            if w - cmdw >= 24:
+                l = Line(w).add("    ").add(c, TEAL).pad(cmdw)
+                rows.append(l.add(clip(t, w - l.n - 1), DIM).out())
+            else:
+                rows.append(Line(w).add("    ").add(c, TEAL).out())
+                rows.append(Line(w).add("      ").add(t, DIM).out())
+        rows.append(Line(w).add("    Taught in every agent's CLAUDE.md, under \"Other agents\".", FAINT).out())
+        return head, [(None, rows, None)]
+
+    def summary(self, W):
+        d = self.data
+        cnt = d["counts"]
+        head = Line(W).add("  ◆ ", CYAN).add("BOARD", WHITE + BOLD).add("     ")
+        for st in ("working", "asking", "waiting", "idle"):
+            if cnt.get(st):
+                head.add("● ", STATE_COLOUR[st]).add(f"{cnt[st]} {st}", TEXT).add("    ")
+        if cnt.get("frozen"):
+            head.add("● ", BLUE).add(f"{cnt['frozen']} frozen", TEXT).add("    ")
+        if cnt.get("parked"):
+            head.add("○ ", DIM).add(f"{cnt['parked']} parked", DIM)
+        head.right([(self.me or "?", WHITE), ("  ·  ", FAINT), (time.strftime("%H:%M"), TEXT), (" ", "")])
+        n, s, c = len(d["feed"]), len(d["claims"]), len(d["collisions"])
+        k = sum(1 for n in d["needs"] if not forgotten(n, time.time()))
+        hd = len(d["holds"])
+        bits = ([(plural(hd, "hold"), AMBER)] if hd else []) + [
+                (f"{plural(n, 'message')} in 24 h", TEAL if n else DIM),
+                (f"{s} status{'' if s == 1 else 'es'}", CYAN if s else DIM),
+                (f"{len(d['loose'])} without a status", DIM),
+                (plural(c, "collision") if c else "no collisions", RED if c else DIM),
+                (f"{k} need{'s' if k == 1 else ''} you" if k else "nobody needs you", PURPLE if k else DIM)]
+        sub = Line(W).add("    ")
+        for i, (t, colour) in enumerate(bits):
+            if sub.n + 7 + width(t) > W - 14:
+                break
+            if i:
+                sub.add("   ·   ", FAINT)
+            sub.add(t, colour)
+        sub.right([(f"git {age(time.time() - self.git_ts)} ago" if self.git_ts else "git …", FAINT), (" ", "")])
+        return [head.out(), sub.out(), Line(W).fill("─", W, BORDER).out(), " " * W]
+
+    def build(self, W, H):
+        top = self.summary(W)
+        self.top_h = len(top)
+        self.body_h = max(3, H - len(top) - 1)
+        two = W >= 130
+        lw = max(64, int(W * 0.57)) if two else W
+        rw = W - lw - 3 if two else 0
+        main = self.history_view(lw) if self.history else self.messages(lw)
+        if two:
+            side = [f(rw) for f in (self.holds, self.collisions, self.needs, self.working, self.cleared, self.howto)]
+            spec = [(lw, main[0], [(None, main[1])]), (rw, None, side)]
+        else:
+            self.focus = 0
+            parts = [self.holds(W), self.collisions(W), self.needs(W), main, self.working(W), self.cleared(W), self.howto(W)]
+            spec = [(W, None, parts)]
+        self.items, self.cols = [], []
+        for ci, (cw_, pin, parts) in enumerate(spec):
+            rows = []
+            for head, items in parts:
+                if head:
+                    rows.extend(head(0))
+                for key, blk, target in items:
+                    start = len(rows)
+                    rows.extend(blk)
+                    if key:
+                        self.items.append({"col": ci, "start": start, "end": len(rows), "session": key, "target": target})
+            pin_h = len(pin(0)) if pin else 0
+            self.cols.append({"w": cw_, "rows": rows, "pin": pin, "pin_h": pin_h, "h": max(1, self.body_h - pin_h)})
+        if self.follow:
+            self.ensure_visible()
+            self.follow = False
+        views = []
+        for ci, c in enumerate(self.cols):
+            s = self.scroll[ci] = max(0, min(self.scroll[ci], max(0, len(c["rows"]) - c["h"])))
+            view = (c["pin"](s) if c["pin"] else []) + c["rows"][s:s + c["h"]]
+            view += [" " * c["w"]] * (self.body_h - len(view))
+            more = len(c["rows"]) - s - c["h"]
+            if more > 0:
+                view[-1] = Line(c["w"]).right([(f"↓ {more} more ", FAINT)]).out()
+            views.append(view)
+        sep = Line(1).add("│", BORDER).out()
+        body = [views[0][i] + (" " + sep + " " + views[1][i] if two else "") for i in range(self.body_h)]
+        self.colx = lw + 2 if two else None
+
+        foot = Line(W).add("  ↑↓", CYAN).add(" select   ", DIM).add("⏎", CYAN).add(" jump   ", DIM)
+        if two:
+            foot.add("⇥", CYAN).add(" other column   ", DIM)
+        foot.add("h", CYAN).add(" back to live   " if self.history else " history   ", DIM).add("r", CYAN).add(" rescan git", DIM)
+        if self.error:
+            foot.add("    ").add(clip(self.error, 60), RED)
+        foot.right([("◇", TEAL), (" board note   ", FAINT), ("⇢", CYAN), (" direct message   ", FAINT),
+                    ("▎", TEXT), (" status   ", FAINT), ("✖", RED), (" collision ", FAINT)])
+        return top + body + [foot.out()]
+
+    def find(self, key):
+        return next((i for i in self.items if i["session"] == key), None)
+
+    def ensure_visible(self):
+        it = self.find(self.sel)
+        if it is None:
+            return
+        ci, h = it["col"], self.cols[it["col"]]["h"]
+        if it["start"] < self.scroll[ci]:
+            self.scroll[ci] = max(0, it["start"] - 1)
+        elif it["end"] > self.scroll[ci] + h:
+            self.scroll[ci] = min(it["start"], it["end"] - h)
+
+    def column(self, ci):
+        return sorted((i for i in self.items if i["col"] == ci), key=lambda i: i["start"])
+
+    def move(self, step):
+        it = self.find(self.sel)
+        ci = it["col"] if it else self.focus
+        items = self.column(ci)
+        if not items and len(self.cols) > 1:
+            ci = 1 - ci
+            items = self.column(ci)
+        if not items:
+            return
+        self.focus, self.follow = ci, True
+        keys = [i["session"] for i in items]
+        if it is None:
+            top = [i for i in items if i["start"] >= self.scroll[ci]] or items
+            self.sel = top[0]["session"] if step > 0 else items[-1]["session"]
+            return
+        self.sel = keys[max(0, min(len(keys) - 1, keys.index(self.sel) + step))]
+
+    def switch(self):
+        if len(self.cols) < 2:
+            return
+        self.focus = 1 - self.focus
+        items = self.column(self.focus)
+        top = [i for i in items if i["start"] >= self.scroll[self.focus]] or items
+        self.sel = top[0]["session"] if top else None
+        self.follow = True
+
+    def page(self, n):
+        ci = self.focus
+        h = self.cols[ci]["h"] if ci < len(self.cols) else self.body_h
+        self.scroll[ci] = max(0, self.scroll[ci] + n * max(1, h - 2))
+
+    def col_at(self, x):
+        return 1 if self.colx is not None and x >= self.colx else 0
+
+    def target_of(self, key):
+        it = self.find(key)
+        return it["target"] if it else None
+
+    def at(self, x, y):
+        ci = self.col_at(x)
+        if ci >= len(self.cols):
+            return None
+        row = y - self.top_h - self.cols[ci]["pin_h"]
+        if row < 0:
+            return None
+        row += self.scroll[ci]
+        for i in self.items:
+            if i["col"] == ci and i["start"] <= row < i["end"]:
+                return i["session"]
+        return None
+
+
+def git_snapshot(agents, recs, max_age=300):
+    g = load_json(GITCACHE)
+    if time.time() - g.get("ts", 0) > max_age:
+        GitRefresh(repo_dirs(agents, recs)).run()
+        g = load_json(GITCACHE)
+    return g
+
+
+def clashes_for(me, d):
+    out = []
+    for c in d["collisions"]:
+        if c[0] == "claim":
+            _, r, p, o, q = c
+            if me not in (r["agent"], o["agent"]):
+                continue
+            mine, other = (p, (o, q)) if r["agent"] == me else (q, (r, p))
+            note = f": {other[0]['what']}" if other[0].get("what") else ""
+            out.append(f"{label(other[0])} also claims {other[1]}, overlapping your {mine}{note}")
+        elif c[0] == "intrude":
+            _, x, r, p, inside = c
+            if r["agent"] == me:
+                out.append(f"{x['name']}{' (a' + x['slot'] + ')' if x['slot'] else ''} has {plural(len(inside), 'changed file')} "
+                           f"inside your {p}: {', '.join(f[2] for f in inside[:3])}")
+            elif x["name"] == me:
+                note = f" ({r['what']})" if r.get("what") else ""
+                out.append(f"you have {plural(len(inside), 'changed file')} inside {label(r)}'s claim on {p}{note}")
+        else:
+            _, who, keys = c
+            if me in (x["name"] for x in who):
+                others = ", ".join(f"{x['name']} (a{x['slot']})" for x in who if x["name"] != me)
+                out.append(f"you and {others} both change {plural(len(keys), 'file')}: {', '.join(keys[:3])}"
+                           + (f", +{len(keys) - 3}" if len(keys) > 3 else ""))
+    return out
+
+
+def cmd_ls(argv):
+    me = take(argv, "--for")
+    me_sid = ""
+    if me is None and os.environ.get("TMUX_PANE"):
+        me = tmux("display-message", "-p", "-t", os.environ["TMUX_PANE"], "#{session_name}") or None
+        me_sid = tmux("display-message", "-p", "-t", os.environ["TMUX_PANE"], "#{session_id}")
+    brief = "--brief" in argv
+    c = (lambda code, s: f"{code}{s}{RESET}") if sys.stdout.isatty() and not brief else (lambda code, s: s)
+    now = int(time.time())
+    agents = fleet(0)
+    act = activity(agents)
+    allrecs = read()
+    recs = visible(allrecs, now, agents)
+    mine = next((r for r in recs if r["agent"] == me), None)
+    if mine is None and me:
+        mine = next((r for r in allrecs if r["agent"] == me and now <= lapses(r, act)), None)
+        if mine:
+            recs.append(mine)
+    out = []
+    holds = live_holds(now, agents)
+    if holds:
+        out.append(c(BOLD + AMBER, "HOLDS") + "  do not release, pin or sync what another agent holds; "
+                   "agent-board hold NAME tells you when it is free")
+        out.extend("  " + hold_line(h, now, me) for h in holds)
+    if mine:
+        said_ago = age(now - mine.get("what_ts", mine.get("since", now)))
+        held = f", holding {', '.join(mine['paths'])}" if mine.get("paths") else ""
+        out.append(c(BOLD, f"YOU ({me})") + f"  {mine.get('what') or '(no sentence)'}" + c(DIM, f"  (said {said_ago} ago{held})"))
+    elif me and not brief:
+        out.append(c(BOLD, f"YOU ({me})") + '  no status. When you start a task: agent-board claim [PATH…] --what "…"')
+
+    if me:
+        posts = live_posts(read_posts(), now)
+        th = threads(posts)
+        claimed = mine.get("paths", []) if mine else []
+        unread = sum(1 for t in th.values() for p in t if not seen_by(p, me) and for_me(p, me, me_sid, t, claimed))
+        to_all = sum(1 for t in th.values() if broadcast(t[0]) and t[0]["from"] != me and not seen_by(t[0], me))
+        bits = ([f"{unread} for you"] if unread else []) + ([f"{to_all} to everyone"] if to_all else [])
+        if bits:
+            out.append(c(BOLD, "NOTES") + f"  {' and '.join(bits)}, unread: agent-board read")
+        elif not brief:
+            out.append(c(BOLD, "NOTES") + c(DIM, f"  nothing unread ({plural(len(th), 'thread')} in 24 h, agent-board read --all)"))
+
+        if not brief:
+            d = analyse(agents, recs, git_snapshot(agents, recs), [])
+            hits = clashes_for(me, d)
+            if hits:
+                out.append(c(BOLD + RED, "CLASHES") + "  settle these with them before you edit (agent-board post --to NAME):")
+                out.extend("  " + c(RED, "! ") + h for h in hits)
+
+    others = sorted((r for r in recs if r["agent"] != me), key=lambda r: -r.get("ts", 0))
+    by_name = {a["name"]: a for a in agents}
+    out.append(c(BOLD, "WORKING ON") + (f"  {len(others)}" if others else c(DIM, "  nobody else has said")))
+    for r in others:
+        a = by_name.get(r["agent"])
+        out.append(f"  {c(NAME, label(r))}  {clip(r.get('what', ''), 200) or c(DIM, '(no sentence)')}"
+                   + c(DIM, f"  {state_word(a)}, for {age(now - r.get('since', now))}"))
+        if r.get("paths"):
+            out.append(c(DIM, "      " + ", ".join(r["paths"])))
+    out.append(c(DIM, 'agent-board claim [PATH…] --what "…" · done · hold NAME · free NAME · post "…" --to NAME (or --path PATH) '
+                      '· reply ID "…" · read'))
+    print("\n".join(out))
+
+
+def jump(session, agents):
+    a = next((x for x in agents if x["name"] == session), None)
+    me = os.environ.get("TMUX_PANE", "")
+    clients = tmux("list-clients", "-t", me, "-F", "#{client_activity} #{client_name}").splitlines() if me else []
+    best = max((c.split(" ", 1) for c in clients if " " in c), key=lambda c: int(c[0] or 0), default=None)
+    target = a["pane"] if a else session
+    args = ["switch-client"] + (["-c", best[1]] if best else []) + ["-t", a["sid"] if a else session]
+    subprocess.run(["tmux", *args, ";", "select-window", "-t", target, ";", "select-pane", "-t", target],
+                   capture_output=True)
+
+
+def visible_now():
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return True
+    return tmux("display-message", "-p", "-t", pane, "#{&&:#{window_active},#{session_attached}}") == "1"
+
+
+def cmd_watch(argv):
+    pane = os.environ.get("TMUX_PANE", "")
+    iw = tmux("show-option", "-gqv", "@agent_sidebar_idle_wait")
+    idle_wait = int(iw) * 60 if iw.isdigit() else 1800
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    rpipe, wpipe = os.pipe()
+    os.set_blocking(wpipe, False)
+    signal.set_wakeup_fd(wpipe)
+    signal.signal(signal.SIGWINCH, lambda *_: None)
+    page = Page("")
+    prev, agents, refresher = [], [], None
+    last_data = last_vis = 0.0
+    seen = True
+    force = dirty = True
+    buf = b""
+    born = os.stat(SELF).st_mtime_ns
+    pending = None
+
+    def restore():
+        sys.stdout.write("\033[?1004l\033[?1006l\033[?1000l\033[?25h\033[?1049l")
+        sys.stdout.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.write("\033[?1049h\033[?25l\033[?1000h\033[?1006h\033[?1004h\033[2J")
+        sys.stdout.flush()
+        while True:
+            now = time.time()
+            try:
+                stamp = os.stat(SELF).st_mtime_ns
+            except OSError:
+                stamp = born
+            if stamp != born:
+                if pending == stamp:
+                    try:
+                        compile(Path(SELF).read_bytes(), SELF, "exec")
+                    except (SyntaxError, ValueError, OSError):
+                        born = stamp
+                    else:
+                        restore()
+                        os.execv(sys.executable, [sys.executable, SELF, "watch"])
+                pending = stamp
+            if now - last_vis >= (1 if seen else 4):
+                was, seen, last_vis = seen, visible_now(), now
+                force = force or (seen and not was)
+            if seen and (force or now - last_data >= 2):
+                try:
+                    page.me = tmux("display-message", "-p", "-t", pane, "#{session_name}") if pane else ""
+                    agents = collect_agents(idle_wait)
+                    recs = visible(read(), int(now), agents)
+                    gitdata = load_json(GITCACHE)
+                    page.git_ts = gitdata.get("ts", 0)
+                    if now - page.git_ts > GIT_EVERY and (refresher is None or not refresher.is_alive()):
+                        refresher = GitRefresh(repo_dirs(agents, recs))
+                        refresher.start()
+                    page.data = analyse(agents, recs, gitdata, log_tail())
+                    page.error = ""
+                except Exception as e:
+                    page.error = f"{type(e).__name__}: {e}"
+                last_data, dirty = now, True
+            if seen and dirty and page.data is not None:
+                try:
+                    size = os.get_terminal_size(sys.stdout.fileno())
+                    frame = page.build(size.columns, size.lines)
+                except Exception as e:
+                    page.error = f"{type(e).__name__}: {e}"
+                    frame = prev
+                out = ["\033[2J"] if force else []
+                for i, line in enumerate(frame):
+                    if force or i >= len(prev) or prev[i] != line:
+                        out.append(f"\033[{i + 1};1H{line}\033[0m")
+                sys.stdout.write("".join(out))
+                sys.stdout.flush()
+                prev, force, dirty = frame, False, False
+            r, _, _ = select.select([fd, rpipe], [], [], 1.0)
+            if rpipe in r:
+                os.read(rpipe, 512)
+                force = dirty = True
+            if fd not in r:
+                continue
+            buf += os.read(fd, 4096)
+            dirty = True
+            while buf:
+                m = re.match(rb"\x1b\[<(\d+);(\d+);(\d+)([Mm])", buf)
+                if m:
+                    buf = buf[m.end():]
+                    b, x, y = int(m.group(1)), int(m.group(2)) - 1, int(m.group(3)) - 1
+                    if m.group(4) == b"M" and b in (64, 65):
+                        ci = page.col_at(x)
+                        page.focus = ci
+                        page.scroll[ci] = max(0, page.scroll[ci] + (-3 if b == 64 else 3))
+                    elif m.group(4) == b"M" and b == 0:
+                        hit = page.at(x, y)
+                        if hit:
+                            page.sel, page.focus = hit, page.col_at(x)
+                            jump(page.target_of(hit), agents)
+                    continue
+                if buf[:2] in (b"\x1b[", b"\x1bO"):
+                    m = re.match(rb"\x1b[\[O]([0-9;]*)([A-Za-z~])", buf)
+                    if not m:
+                        if len(buf) < 16:
+                            break
+                        buf = buf[1:]
+                        continue
+                    buf = buf[m.end():]
+                    k = m.group(1) + m.group(2)
+                    if k == b"A":
+                        page.move(-1)
+                    elif k == b"B":
+                        page.move(1)
+                    elif k == b"C" and page.focus == 0 or k == b"D" and page.focus == 1:
+                        page.switch()
+                    elif k == b"5~":
+                        page.page(-1)
+                    elif k == b"6~":
+                        page.page(1)
+                    elif k == b"I":
+                        last_vis = 0.0
+                    continue
+                ch, buf = buf[:1], buf[1:]
+                if ch == b"j":
+                    page.move(1)
+                elif ch == b"k":
+                    page.move(-1)
+                elif ch == b"\t":
+                    page.switch()
+                elif ch == b"g":
+                    page.scroll[page.focus] = 0
+                elif ch == b"G":
+                    page.scroll[page.focus] = 10 ** 6
+                elif ch == b"h":
+                    page.history = not page.history
+                    page.scroll[0] = 0
+                    if page.sel and page.sel.startswith(("post:", "direct:")):
+                        page.sel = None
+                elif ch in (b"\r", b"\n") and page.target_of(page.sel):
+                    jump(page.target_of(page.sel), agents)
+                elif ch == b"r":
+                    try:
+                        GITCACHE.unlink()
+                    except OSError:
+                        pass
+                    last_data = 0.0
+                elif ch == b"\x1b" and not buf:
+                    page.sel = None
+    except KeyboardInterrupt:
+        pass
+    finally:
+        restore()
+
+
+def board_window(sess):
+    for line in tmux("list-windows", "-t", sess, "-F", "#{window_id}\t#{window_name}").splitlines():
+        wid, _, name = line.partition("\t")
+        if name == "board":
+            return wid
+    return None
+
+
+def cmd_open(argv):
+    sess = argv[0] if argv else tmux("display-message", "-p", "#{session_id}")
+    wid = board_window(sess)
+    if wid:
+        tmux("select-window", "-t", wid)
+    else:
+        tmux("new-window", "-t", f"{sess}:", "-n", "board", f"{SELF} watch")
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv and (argv[0] in ("-h", "--help", "help") or argv[1:2] in (["-h"], ["--help"], ["help"])):
+        print(__doc__.strip())
+        return
+    verb = argv.pop(0) if argv and not argv[0].startswith("-") else "ls"
+    cmds = {"claim": cmd_claim, "done": cmd_done, "ls": cmd_ls, "watch": cmd_watch, "open": cmd_open,
+            "post": cmd_post, "reply": cmd_reply, "read": cmd_read, "hook": cmd_hook,
+            "hold": cmd_hold, "free": cmd_free, "holds": cmd_holds, "guard": cmd_guard}
+    if verb not in cmds:
+        die(f"unknown command {verb!r}\n\n{__doc__.strip()}")
+    cmds[verb](argv)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+        sys.stdout.flush()
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
