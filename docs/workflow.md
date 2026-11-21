@@ -8,7 +8,8 @@ them, ending and resetting them, and bringing them back after a tmux restart.
 | sidebar (C), agent tools, tmux agent layer | `~/forge/agent-sidebar/` (`bin/`, `tmux/`) | `brokenlander/agent-sidebar` (public) |
 | base tmux config (loads the agent layer) | `~/dotfiles/tmux/.tmux.conf` | `brokenlander/dotfiles` (public) |
 | optional workspace with slots | `~/.config/agent-sidebar/workspace` | none, per machine |
-| Claude settings, theme, statusline, persona | `~/.claude/` | none, local only |
+| persona (Cyan) | `claude/persona.md`, kept at the top of `~/.claude/CLAUDE.md` by `claude/persona.sh` | `brokenlander/dotfiles` |
+| Claude settings, theme, statusline | `~/.claude/` | none, local only |
 
 Commits to both repos go out as
 `brokenlander <94259413+brokenlander@users.noreply.github.com>`. No AI
@@ -46,6 +47,11 @@ The `? shortcuts` row in the sidebar shows the same keys in two groups.
 
 Pickers share `tmux/fzf-theme.sh` and open with `display-popup -B`. The status
 bar forks nothing: no `#()` anywhere in a format.
+
+Everything drawn in tmux takes its colours from the terminal palette, so it
+follows the terminal's theme (Ristretto in foot). The bar keeps its rounded
+pills. Their Nerd Font glyphs are `\u` escapes in the dotfiles' `.tmux.conf`, because an
+editor once dropped the raw characters. `sh tests/tmux-theme.sh` (dotfiles) checks all of it.
 
 ## Sidebar
 
@@ -203,8 +209,9 @@ restarts any board left on a bare shell.
 ## Claude settings
 
 - `statusline.sh`: `<model> · <dir> · <branch> · <ctx%>`, with the model
-  shown under an alias set at the top of the file.
-- `themes/cyan.json`, used as `"theme": "custom:cyan"`. The bypass-permissions
+  shown under an alias set at the top of the file, in palette colours.
+- `themes/cyan.json`, used as `"theme": "custom:cyan"`: base `dark-ansi` with
+  `ansi:` overrides, so the agent UI follows the palette too. The bypass-permissions
   footer takes the `error` colour. `~/.claude/themes/` must exist when the CLI
   starts.
 - `settings.json` hooks: `tmux/claude-pane-hook.sh` (tags the pane),

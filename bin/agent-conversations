@@ -21,10 +21,10 @@ HISTORY = CFG / "history.jsonl"
 BRIEF = "Session bootstrap"
 TITLE_TYPES = ("custom-title", "agent-name", "ai-title")
 
-DIM = "\033[38;2;86;95;137m"
-NAME = "\033[38;2;145;180;250m"
-YOU = "\033[38;2;125;207;255m"
-AGENT = "\033[38;2;187;154;247m"
+DIM = "[90m"
+NAME = "[94m"
+YOU = "[36m"
+AGENT = "[35m"
 RESET = "\033[0m"
 
 
